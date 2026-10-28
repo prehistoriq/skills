@@ -31,6 +31,8 @@ Every file not listed here is byte-identical to the upstream file at the SHA abo
 
    This binds the preset to the prehistoriq findings area.
 
+2. `review-anvil-pr/SKILL.md`. A **Share with prehistoriq** paragraph at the end of step 3, before step 4. It runs `prehistoriq share findings "$REPORT_PATH"` when `command -v prehistoriq` succeeds, and never fails the review. It sits before `post`, because `post` deletes the report.
+
 ## Known upstream text
 
 Some text still points at the upstream repo. It is left as is to keep the copy minimal.
