@@ -1,6 +1,8 @@
 ---
 name: review-anvil-pr
 description: Read-only multi-agent review of a GitHub Pull Request, with the synthesized report posted back as a PR comment so the author is notified. Use when the user wants to review a GitHub PR (github.com or GitHub Enterprise) and post a structured review back to the PR conversation; the PR is auto-detected from the checked-out branch when no locator is supplied. Activates the `review-anvil` engine in read-only mode.
+metadata:
+  prehistoriq-area: findings
 ---
 
 # review-anvil-pr
