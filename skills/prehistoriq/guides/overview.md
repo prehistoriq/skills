@@ -1,4 +1,4 @@
-# prehistoriq guide: overview
+# The overview area
 
 The overview area holds an explanation of a pull request that people read before the diff. prehistoriq shows it on the PR's Overview tab.
 

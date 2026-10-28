@@ -1,4 +1,4 @@
-# prehistoriq guide: findings
+# The findings area
 
 The findings area holds code review findings for a pull request. prehistoriq shows each finding next to the code it is about, on the PR's Findings tab.
 
