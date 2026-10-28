@@ -39,9 +39,10 @@ The limiter lives in `app/limits.py:15-27`.
 
 Mermaid blocks are fenced with `mermaid`. prehistoriq renders them in the browser, as GitHub does.
 
-- Put every node label in double quotes.
-- Node ids are letters, digits and underscores only.
-- Never put a double quote, a backtick or a semicolon inside a label.
+- Node ids and participant names are letters, digits and underscores only.
+- In a flowchart, put every node label in double quotes.
+- In a sequence diagram, write aliases and messages without quotes. Quotes there show up literally.
+- Never put a double quote, a backtick, a semicolon or a `#` inside a label or a message.
 
 ## Images
 

@@ -84,9 +84,10 @@ flowchart TD
 
 Mermaid syntax rules that keep GitHub from showing an error.
 
-- Node ids are letters, digits and underscores only.
-- Put every label in double quotes. Never put a double quote, a backtick or a semicolon inside a label.
-- Edge labels are plain words between `--` and `-->`, as in `a -- calls --> b`.
+- Node ids and participant names are letters, digits and underscores only.
+- In a flowchart, put every node label in double quotes, as in `req["POST /login"]`. Edge labels are plain words, as in `a -- calls --> b`.
+- In a sequence diagram, write aliases and messages without quotes, as in `participant Hook as pre-push hook`. Quotes there show up literally.
+- Never put a double quote, a backtick, a semicolon or a `#` inside a label or a message.
 - One statement per line. No trailing spaces after `end`.
 - When `mmdc` is on PATH, check each block with it before you finish.
 
