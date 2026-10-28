@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 // Checks every skill's frontmatter and the area guides' examples.
 // `--drift` also asks GitHub whether the review-anvil upstream moved past the pinned SHA.
+// With PREHISTORIQ_CLI=<path to cli.mjs>, every complete guide example must pass `share --dry-run`.
 
-import { readFileSync, readdirSync, existsSync } from "node:fs"
+import { execFileSync, spawnSync } from "node:child_process"
+import { readFileSync, readdirSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -148,6 +151,43 @@ function checkGuide(area) {
   if (area === "findings" && markers === 0) fail(where, "has no finding marker example")
 }
 
+// Fenced `markdown` blocks with a title (a heading or frontmatter); fragments without one are skipped.
+function examples(text) {
+  const out = []
+  let open = null
+  for (const [i, line] of text.split("\n").entries()) {
+    const f = line.match(/^(`{3,}|~{3,})(.*)$/)
+    if (!open && f) open = { fence: f[1], lang: f[2].trim(), line: i + 2, body: [] }
+    else if (open && f && f[1][0] === open.fence[0] && f[1].length >= open.fence.length && !f[2].trim()) {
+      const body = open.body.join("\n")
+      if (open.lang === "markdown" && /^(---\ntitle:|#{1,6} )/m.test(body)) out.push({ line: open.line, body })
+      open = null
+    } else if (open) open.body.push(line)
+  }
+  return out
+}
+
+function checkExamples(cli, area) {
+  const where = `skills/prehistoriq/guides/${area}.md`
+  const dir = mkdtempSync(join(tmpdir(), "check-skills-"))
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_AUTHOR_NAME: "c", GIT_AUTHOR_EMAIL: "c@example.invalid", GIT_COMMITTER_NAME: "c", GIT_COMMITTER_EMAIL: "c@example.invalid" }
+  execFileSync("git", ["init", "-q"], { cwd: dir, env })
+  execFileSync("git", ["commit", "-q", "--allow-empty", "-m", "empty"], { cwd: dir, env })
+  const found = examples(readFileSync(join(skillsDir, "prehistoriq", "guides", `${area}.md`), "utf8"))
+  console.log(`examples: ${where} has ${found.length}, each checked with share --dry-run`)
+  for (const ex of found) {
+    const file = join(dir, `example-${ex.line}.md`)
+    writeFileSync(file, `${ex.body}\n`)
+    // Linked images in an example stand for files the author would have; give each a stub.
+    for (const [, target] of ex.body.matchAll(/!\[[^\]]*\]\(([^)\s]+)\)/g)) {
+      mkdirSync(dirname(join(dir, target)), { recursive: true })
+      writeFileSync(join(dir, target), "<svg xmlns='http://www.w3.org/2000/svg'/>")
+    }
+    const run = spawnSync(process.execPath, [cli, "share", area, file, "--dry-run"], { cwd: dir, env, encoding: "utf8" })
+    if (run.status !== 0) fail(`${where}:${ex.line}`, `example fails share --dry-run (exit ${run.status}): ${(run.stderr || run.stdout).trim()}`)
+  }
+}
+
 async function drift() {
   const source = readFileSync(join(skillsDir, "review-anvil", "SOURCE.md"), "utf8")
   const field = (name) => source.match(new RegExp(`^\\| ${name} \\| \`?([^|\`]+?)\`? \\|$`, "m"))?.[1]
@@ -181,6 +221,8 @@ const found = readdirSync(skillsDir, { withFileTypes: true })
 for (const name of found) if (!(name in EXPECTED)) fail(`skills/${name}`, "not listed in EXPECTED in scripts/check-skills.mjs")
 for (const name of Object.keys(EXPECTED)) checkSkill(name)
 for (const area of AREAS) checkGuide(area)
+if (process.env.PREHISTORIQ_CLI) for (const area of AREAS) checkExamples(process.env.PREHISTORIQ_CLI, area)
+else console.log("examples: skipped, set PREHISTORIQ_CLI to a prehistoriq cli.mjs to run share --dry-run on them")
 if (process.argv.includes("--drift")) await drift()
 
 if (errors.length) {
