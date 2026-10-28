@@ -1,0 +1,2734 @@
+#!/usr/bin/env bash
+# End-to-end smoke tests for pr-helper.sh. These tests use a fake `gh`
+# binary and never touch the network.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HELPER="$ROOT/pr-helper.sh"
+REPRODUCTION_LINE='**Reproduction:** 4 candidates; 3 confirmed, 1 deferred after failed reproduction.'
+
+fail() {
+    printf 'test-pr-helper: %s\n' "$*" >&2
+    exit 1
+}
+
+assert_file_missing() {
+    local path="$1"
+    [[ ! -e "$path" ]] || fail "expected file to be cleaned up: $path"
+}
+
+make_report() {
+    local path="$1"
+    {
+        printf '# ⚒️ review-anvil report\n\n'
+        printf '**Review decision:** COMMENT — material findings need attention.\n'
+        printf '**Result:** 3 findings confirmed.\n'
+        printf '**Scope:** Inline processing e2e fixture.\n\n'
+        printf '%s\n\n' "$REPRODUCTION_LINE"
+        printf '**Adversarial review:** targeted, 2 agents; 2 upheld, 1 hardened, 0 deferred, 0 dropped.\n\n'
+        printf '## Findings\n'
+        printf -- '- **RAV-RUN3-R2-F001 [medium] auth** `src/auth.ts:12` — finding 01 has a long explanation that should post in full while retaining the finding number 01 and still point to the inline comment.\n'
+        printf -- '- **RAV-R3-F002 [high] db** `src/db.ts:8` — finding 02 remains inline.\n'
+        printf -- '- **RAV-RUN3-R2-F003 [low] docs** `README.md:4` — finding 03 stays summary-only.\n'
+        printf '\n## Non-Blocking Notes\n'
+        printf -- '- **[low] docs** — low priority note should be collapsed but preserved.\n'
+        printf '\n<details>\n<summary>Run details</summary>\n\n'
+        printf -- '- Rounds: 1/1\n- Mix: 2 codex-exec + 1 claude-exec\n'
+        printf '\n</details>\n'
+        printf '\n---\n_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._\n'
+    } >"$path"
+}
+make_compact_report() {
+    local path="$1"
+    cat >"$path" <<EOF
+A state-validation issue and a write-accounting issue remain.
+
+<details>
+<summary>Issues and fixes</summary>
+
+- Refresh accepts missing state. <!-- review-anvil-report: id=RAV-RUN3-R2-F001 severity=medium area=auth path=src%2Fauth.ts start_line=- line=12 disposition=active -->
+- Write failures are reported as success. <!-- review-anvil-report: id=RAV-R3-F002 severity=high area=db path=src%2Fdb.ts start_line=- line=8 disposition=active -->
+
+</details>
+
+<details>
+<summary>Review context</summary>
+
+$REPRODUCTION_LINE
+
+**Adversarial review:** targeted, 2 agents; 2 upheld, 1 hardened, 0 deferred, 0 dropped.
+
+</details>
+
+_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._
+EOF
+}
+
+
+make_inline() {
+    local path="$1"
+    cat >"$path" <<'JSON'
+[
+  {
+    "path": "src/auth.ts",
+    "line": 12,
+    "side": "RIGHT",
+    "severity": "medium",
+    "body": "**[medium] auth** — Refresh accepts missing state.\n\nThe handler rotates the session before validating the state token, so a stale tab can mint a new session after the old token should have failed. This paragraph is intentionally long so the inline processor has to preserve it without losing the core point.\n\nMove state validation before session rotation and add a regression test for missing state.",
+    "suggestion": "validateState(req);\nreturn refreshSession(req);"
+  },
+  {
+    "path": "README.md",
+    "line": 4,
+    "side": "RIGHT",
+    "severity": "low",
+    "body": "**[low] docs** — Option name differs from CLI help."
+  },
+  {
+    "path": "src/db.ts",
+    "line": 8,
+    "side": "RIGHT",
+    "body": "**RAV-R3-F002 [high] db** — Write failures are reported as success."
+  }
+]
+JSON
+}
+
+install_fake_gh() {
+    local bin_dir="$1"
+    cat >"$bin_dir/gh" <<'GH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "$1 $2" in
+  "api repos/acme/widgets/pulls/42/reviews")
+    has_input=0
+    for arg in "$@"; do
+      if [[ "$arg" == "--input" ]]; then
+        has_input=1
+      fi
+    done
+    if [[ "$has_input" == "0" ]]; then
+      exit 0
+    fi
+    if [[ "${GH_MOCK_REVIEW_FAIL:-0}" == "1" ]]; then
+      printf 'mock review failure\n' >&2
+      exit 1
+    fi
+    payload="$(cat)"
+    if [[ "${GH_MOCK_INLINE_REVIEW_FAIL:-0}" == "1" ]] \
+       && jq -e '.comments | length > 0' <<<"$payload" >/dev/null; then
+      printf 'mock inline review failure\n' >&2
+      exit 1
+    fi
+    if [[ "${GH_MOCK_APPROVE_FAIL:-0}" == "1" ]] \
+       && jq -e '.event == "APPROVE"' <<<"$payload" >/dev/null; then
+      printf 'mock approval failure\n' >&2
+      exit 1
+    fi
+    printf '%s' "$payload" >"$GH_MOCK_REVIEW_PAYLOAD"
+    printf '{"html_url":"https://example.invalid/review/1"}\n'
+    ;;
+  "api repos/acme/widgets/issues/42/comments")
+    if [[ "${GH_MOCK_START_COMMENT:-0}" == "1" ]]; then
+      printf '456\thttps://example.invalid/comment/456\n'
+    else
+      printf 'https://example.invalid/comment/1\n'
+    fi
+    ;;
+  "api repos/acme/widgets/issues/comments/123")
+    for arg in "$@"; do
+      if [[ "$arg" == "--input" ]]; then
+        cat >"$GH_MOCK_PATCH_PAYLOAD"
+        printf '{"html_url":"https://example.invalid/comment/123"}\n'
+        exit 0
+      fi
+    done
+    printf 'https://example.invalid/comment/123\n'
+    ;;
+  "api graphql")
+    for arg in "$@"; do
+      if [[ "$arg" == query=mutation*resolveReviewThread* ]]; then
+        thread_id=""
+        for value in "$@"; do
+          if [[ "$value" == threadId=* ]]; then
+            thread_id="${value#threadId=}"
+          fi
+        done
+        [[ -n "$thread_id" ]] || { printf 'missing threadId\n' >&2; exit 2; }
+        if [[ -n "${GH_MOCK_RESOLVED_THREADS:-}" ]]; then
+          printf '%s\n' "$thread_id" >>"$GH_MOCK_RESOLVED_THREADS"
+        fi
+        printf '{"data":{"resolveReviewThread":{"thread":{"id":"%s","isResolved":true}}}}\n' "$thread_id"
+        exit 0
+      fi
+    done
+    if [[ "${GH_MOCK_GRAPHQL_FAIL:-0}" == "1" ]]; then
+      printf 'mock GraphQL failure\n' >&2
+      exit 1
+    fi
+    if [[ -n "${GH_MOCK_GRAPHQL_RESPONSE:-}" ]]; then
+      cat "$GH_MOCK_GRAPHQL_RESPONSE"
+    else
+      printf '{"data":{"repository":{"pullRequest":{"author":{"login":"pr-author"},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n'
+    fi
+    ;;
+  "pr comment")
+    body_file=""
+    while (($#)); do
+      if [[ "$1" == "--body-file" ]]; then
+        body_file="$2"
+        shift 2
+        continue
+      fi
+      shift
+    done
+    [[ -n "$body_file" ]] || { printf 'missing --body-file\n' >&2; exit 2; }
+    cp "$body_file" "$GH_MOCK_COMMENT_BODY"
+    ;;
+  "pr view")
+    printf 'head-sha\n'
+    ;;
+  *)
+    printf 'unexpected gh invocation: %s\n' "$*" >&2
+    exit 99
+    ;;
+esac
+GH
+    chmod +x "$bin_dir/gh"
+}
+
+make_dismissals() {
+    local path="$1"
+    cat >"$path" <<'JSON'
+{
+  "acme/widgets#42": [
+    {
+      "path": "",
+      "pattern": "auth finding 01 has a long explanation that should post in full while retaining the finding number 01 and still point to the inline comment",
+      "reason": "local-test-dismissal"
+    }
+  ]
+}
+JSON
+}
+
+test_process_inline() {
+    local tmp inline
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    inline="$tmp/inline.json"
+    make_inline "$inline"
+
+    REVIEW_ANVIL_INLINE_MAX_CHARS=220 "$HELPER" process-inline "$inline" >/dev/null
+
+    jq -e 'length == 2' "$inline" >/dev/null
+    jq -e 'map(select(.path == "README.md")) | length == 0' "$inline" >/dev/null
+    jq -e '.[0].severity == null and .[0].suggestion == null' "$inline" >/dev/null
+    jq -e '.[0].body | contains("```suggestion")' "$inline" >/dev/null
+    jq -e '.[0].body | contains("without losing the core point")' "$inline" >/dev/null
+    jq -e '.[0].body | contains("preserve it without losing")' "$inline" >/dev/null
+    jq -e '.[0].body | contains("without...") | not' "$inline" >/dev/null
+    jq -e 'map(select(.path == "src/db.ts")) | length == 1' "$inline" >/dev/null
+}
+
+test_process_inline_infers_id_prefixed_severity() {
+    local tmp inline
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    inline="$tmp/inline.json"
+    cat >"$inline" <<'JSON'
+[
+  {
+    "path": "src/db.ts",
+    "line": 8,
+    "side": "RIGHT",
+    "body": "**RAV-RUN3-R2-F002 [high] db** — Write failures are reported as success."
+  },
+  {
+    "path": "src/cache.ts",
+    "line": 4,
+    "side": "RIGHT",
+    "body": "**RAV-R3-F003 [medium] cache** — Cache misses are logged as hits."
+  }
+]
+JSON
+
+    REVIEW_ANVIL_INLINE_MIN_SEVERITY=high "$HELPER" process-inline "$inline" >/dev/null
+
+    jq -e 'length == 1' "$inline" >/dev/null
+    jq -e '.[0].path == "src/db.ts"' "$inline" >/dev/null
+}
+
+test_process_inline_preserves_terminal_finding_metadata() {
+    local tmp inline marker
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    inline="$tmp/inline.json"
+    marker='<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=high area=publication -->'
+    cat >"$inline" <<'JSON'
+[
+  {
+    "path": "src/publish.py",
+    "line": 61,
+    "side": "RIGHT",
+    "body": "**`--replace-existing` can remove the only good copy before replacement is ready**\n\nThe old files are deleted before the replacement is validated.\n\nPlease keep the old files recoverable until the replacement completes.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=high area=publication -->",
+    "suggestion": "keep_recoverable(old_files)\nwrite_replacement()",
+    "prior_feedback": "reintroduced"
+  },
+  {
+    "path": "docs/cli.md",
+    "line": 7,
+    "side": "RIGHT",
+    "body": "**The CLI help uses a different option name**\n\n<!-- review-anvil: id=RAV-RUN5-R1-F002 severity=low area=docs -->"
+  }
+]
+JSON
+
+    "$HELPER" process-inline "$inline" >/dev/null
+
+    jq -e 'length == 1' "$inline" >/dev/null
+    jq -e '.[0].severity == null and .[0].suggestion == null and .[0].prior_feedback == null' "$inline" >/dev/null
+    jq -e --arg marker "$marker" '.[0].body | endswith($marker)' "$inline" >/dev/null
+    jq -e --arg marker "$marker" '.[0].body | split($marker) | length == 2' "$inline" >/dev/null
+    jq -e --arg marker "$marker" '
+      .[0].body
+      | index("```suggestion") < index("<!-- review-anvil: prior_feedback=reintroduced -->")
+        and index("<!-- review-anvil: prior_feedback=reintroduced -->") < index($marker)
+    ' "$inline" >/dev/null
+}
+
+test_process_inline_rejects_severity_mismatch() {
+    local tmp inline original stderr
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    inline="$tmp/inline.json"
+    original="$tmp/original.json"
+    stderr="$tmp/stderr.txt"
+    cat >"$inline" <<'JSON'
+[
+  {
+    "path": "src/publish.py",
+    "line": 61,
+    "side": "RIGHT",
+    "severity": "critical",
+    "body": "**Replacement can delete prior records**\n\nThe old files are removed before validation.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=high area=publication -->"
+  }
+]
+JSON
+    cp "$inline" "$original"
+
+    if "$HELPER" process-inline "$inline" 2>"$stderr"; then
+        fail "process-inline must reject helper and marker severity mismatch"
+    fi
+    grep -Fq 'RAV-RUN5-R1-F001' "$stderr"
+    grep -Fq 'helper severity critical does not match terminal marker severity high' "$stderr"
+    cmp -s "$inline" "$original" \
+        || fail "severity mismatch must leave inline JSON unchanged"
+}
+
+test_process_inline_rejects_invalid_marker_severity_field() {
+    local tmp inline original stderr legacy
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    inline="$tmp/inline.json"
+    original="$tmp/original.json"
+    stderr="$tmp/stderr.txt"
+    legacy="$tmp/legacy.json"
+    cat >"$inline" <<'JSON'
+[
+  {
+    "path": "src/publish.py",
+    "line": 61,
+    "side": "RIGHT",
+    "severity": "HIGH ",
+    "body": "**Replacement can delete prior records**\n\nThe old files are removed before validation.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=high area=publication -->"
+  }
+]
+JSON
+    cp "$inline" "$original"
+
+    if "$HELPER" process-inline "$inline" 2>"$stderr"; then
+        fail "process-inline must reject an invalid helper severity beside metadata"
+    fi
+    grep -Fq 'RAV-RUN5-R1-F001' "$stderr"
+    grep -Fq 'helper severity is invalid' "$stderr"
+    cmp -s "$inline" "$original" \
+        || fail "invalid helper severity must leave inline JSON unchanged"
+
+    cat >"$legacy" <<'JSON'
+[
+  {
+    "path": "src/legacy.py",
+    "line": 8,
+    "side": "RIGHT",
+    "severity": "urgent",
+    "body": "**RAV-R3-F002 [high] runtime** — Legacy visible severity remains readable."
+  }
+]
+JSON
+    REVIEW_ANVIL_INLINE_MIN_SEVERITY=high "$HELPER" process-inline "$legacy"
+    jq -e 'length == 1 and (.[0] | keys == ["body", "line", "path", "side"])' \
+        "$legacy" >/dev/null
+}
+
+test_history_parses_hidden_inline_metadata() {
+    local tmp bin fixture output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[
+    {"isResolved":false,"isOutdated":false,"path":"src/publish.py","line":61,"comments":{"nodes":[
+      {"body":"**`--replace-existing` can remove the only good copy before replacement is ready**\n\nThe old files are deleted before the replacement is validated.\n\nPlease keep the old files recoverable until the replacement completes.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=high area=publication -->","url":"https://example.invalid/maximum-human"}
+    ]}},
+    {"isResolved":false,"isOutdated":false,"path":"src/input.ts","line":13,"comments":{"nodes":[
+      {"body":"**`*.json` files bypass validation**\n\nThe wildcard input reaches the parser without validation.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F002 severity=high area=input-files -->","url":"https://example.invalid/input"}
+    ]}}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    output="$tmp/history.txt"
+
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+
+    grep -Fq '[open] src/publish.py:61 — [high] publication — `--replace-existing` can remove the only good copy before replacement is ready' "$output"
+    grep -Fq 'id=RAV-RUN5-R1-F001' "$output"
+    grep -Fq '[open] src/input.ts:13 — [high] input-files — `*.json` files bypass validation' "$output"
+    grep -Fq 'id=RAV-RUN5-R1-F002' "$output"
+}
+
+test_history_includes_author_replies_for_anvil_threads() {
+    local tmp bin fixture output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[
+    {"id":"PRRT_anvil","isResolved":false,"isOutdated":true,"path":"src/auth.ts","line":12,"comments":{"nodes":[
+      {"author":{"login":"reviewer"},"body":"Refresh accepts missing state.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=medium area=auth -->","url":"https://example.invalid/root"},
+      {"author":{"login":"pr-author"},"body":"The caller rejects missing state before this helper runs.","url":"https://example.invalid/author-reply"},
+      {"author":{"login":"other-reviewer"},"body":"I agree with the original finding.","url":"https://example.invalid/other-reply"}
+    ]}}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    output="$tmp/history.txt"
+
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+
+    grep -Fq '[open,outdated] src/auth.ts:12' "$output"
+    grep -Fq 'thread=PRRT_anvil; anvil=true' "$output"
+    grep -Fq 'The caller rejects missing state before this helper runs.' "$output"
+    grep -Fq 'https://example.invalid/author-reply' "$output"
+    ! grep -Fq 'I agree with the original finding.' "$output"
+}
+
+test_post_resolves_author_explained_anvil_thread() {
+    local tmp bin fixture report resolved
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},"headRefOid":"reviewed-sha",
+  "reviewThreads":{"nodes":[
+    {"id":"PRRT_anvil","isResolved":false,"isOutdated":true,"path":"src/auth.ts","line":12,"comments":{"nodes":[
+      {"author":{"login":"reviewer"},"body":"Refresh accepts missing state.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=medium area=auth -->","url":"https://example.invalid/root"},
+      {"author":{"login":"pr-author"},"body":"The caller rejects missing state before this helper runs.","url":"https://example.invalid/author-reply"}
+    ]}}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    resolved="$tmp/resolved.txt"
+    cat >"$report" <<'REPORT'
+The earlier authentication concern does not apply because the caller rejects the input first.
+
+_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._
+REPORT
+    cat >"$report.resolutions.json" <<'JSON'
+{
+  "head_sha": "reviewed-sha",
+  "threads": [
+    {
+      "thread_id": "PRRT_anvil",
+      "finding_id": "RAV-RUN5-R1-F001",
+      "disposition": "author-explanation-accepted",
+      "reason": "The current caller rejects missing state before this helper runs."
+    }
+  ]
+}
+JSON
+
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_RESOLVED_THREADS="$resolved" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/dev/null
+
+    [[ "$(cat "$resolved")" == "PRRT_anvil" ]]
+    assert_file_missing "$report.resolutions.json"
+}
+
+test_resolve_refuses_changed_pr_head() {
+    local tmp bin fixture artifact resolved
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},"headRefOid":"new-head-sha",
+  "reviewThreads":{"nodes":[
+    {"id":"PRRT_anvil","isResolved":false,"isOutdated":true,"path":"src/auth.ts","line":12,"comments":{"nodes":[
+      {"author":{"login":"reviewer"},"body":"Refresh accepts missing state.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=medium area=auth -->","url":"https://example.invalid/root"},
+      {"author":{"login":"pr-author"},"body":"The caller rejects missing state before this helper runs.","url":"https://example.invalid/author-reply"}
+    ]}}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    artifact="$tmp/resolutions.json"
+    resolved="$tmp/resolved.txt"
+    cat >"$artifact" <<'JSON'
+{
+  "head_sha": "reviewed-sha",
+  "threads": [
+    {
+      "thread_id": "PRRT_anvil",
+      "finding_id": "RAV-RUN5-R1-F001",
+      "disposition": "author-explanation-accepted",
+      "reason": "The explanation matched the reviewed snapshot."
+    }
+  ]
+}
+JSON
+
+    if GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+       GH_MOCK_RESOLVED_THREADS="$resolved" \
+       PATH="$bin:$PATH" \
+         "$HELPER" resolve github.com acme widgets 42 "$artifact" \
+         >"$tmp/stdout" 2>"$tmp/stderr"; then
+        fail "resolve must reject a resolution artifact from an older PR head"
+    fi
+
+    [[ ! -e "$resolved" ]]
+    grep -Fq 'PR head changed since resolution synthesis' "$tmp/stderr"
+}
+
+test_post_refuses_to_resolve_non_anvil_thread() {
+    local tmp bin fixture report resolved
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},"headRefOid":"reviewed-sha",
+  "reviewThreads":{"nodes":[
+    {"id":"PRRT_human","isResolved":false,"isOutdated":true,"path":"src/auth.ts","line":12,"comments":{"nodes":[
+      {"author":{"login":"human-reviewer"},"body":"Refresh accepts missing state.","url":"https://example.invalid/human-root"},
+      {"author":{"login":"pr-author"},"body":"The caller rejects missing state first.","url":"https://example.invalid/author-reply"}
+    ]}}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    resolved="$tmp/resolved.txt"
+    printf 'No current findings.\n' >"$report"
+    cat >"$report.resolutions.json" <<'JSON'
+{
+  "head_sha": "reviewed-sha",
+  "threads": [
+    {
+      "thread_id": "PRRT_human",
+      "finding_id": "RAV-RUN5-R1-F001",
+      "disposition": "author-explanation-accepted",
+      "reason": "The author explanation is valid."
+    }
+  ]
+}
+JSON
+
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_RESOLVED_THREADS="$resolved" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" \
+      >/dev/null 2>"$tmp/stderr"
+
+    [[ ! -e "$resolved" ]]
+    [[ -f "$report.resolutions.json" ]]
+    grep -Fq 'refusing to resolve non-review-anvil thread PRRT_human' "$tmp/stderr"
+    grep -Fq 'retained' "$tmp/stderr"
+}
+
+test_accepted_author_explanation_prevents_recurrence() {
+    local tmp bin fixture report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[
+    {"id":"PRRT_anvil","isResolved":false,"isOutdated":true,"path":"src/auth.ts","line":12,"comments":{"nodes":[
+      {"author":{"login":"reviewer"},"body":"Refresh accepts missing state.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=medium area=auth -->","url":"https://example.invalid/root"},
+      {"author":{"login":"pr-author"},"body":"The caller rejects missing state before this helper runs.","url":"https://example.invalid/author-reply"}
+    ]}}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[
+    {"state":"COMMENTED","body":"<!-- review-anvil-marker: accepted -->\nThe earlier concern does not apply.\n\n<details>\n<summary>Earlier feedback</summary>\n\n- **author-explanation-accepted** — [medium] auth — Refresh accepts missing state. https://example.invalid/author-reply (`RAV-RUN5-R1-F001`)\n\n</details>\n\n_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._","url":"https://example.invalid/accepted-review"}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$tmp/history.txt"
+    grep -Fq '[author-explanation-accepted,outdated] src/auth.ts:12' "$tmp/history.txt"
+    grep -Fq 'thread=PRRT_anvil; anvil=true' "$tmp/history.txt"
+    report="$tmp/report.md"
+    cat >"$report" <<'REPORT'
+# review-anvil report
+
+## Findings
+- **RAV-RUN5-R1-F001 [medium] auth** `src/auth.ts:12` — Refresh accepts missing state.
+REPORT
+    cat >"$report.inline.json" <<'JSON'
+[
+  {
+    "path": "src/auth.ts",
+    "line": 12,
+    "side": "RIGHT",
+    "severity": "medium",
+    "body": "Refresh accepts missing state.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=medium area=auth -->"
+  }
+]
+JSON
+
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/dev/null
+
+    ! grep -Fq 'Refresh accepts missing state' "$tmp/comment.md"
+    [[ ! -e "$tmp/review-payload.json" ]]
+}
+
+test_reintroduced_finding_outranks_accepted_author_explanation() {
+    local tmp bin fixture report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[
+    {"id":"PRRT_anvil","isResolved":false,"isOutdated":true,"path":"src/auth.ts","line":12,"comments":{"nodes":[
+      {"author":{"login":"reviewer"},"body":"Refresh accepts missing state.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=medium area=auth -->","url":"https://example.invalid/root"},
+      {"author":{"login":"pr-author"},"body":"The caller rejects missing state before this helper runs.","url":"https://example.invalid/author-reply"}
+    ]}}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[
+    {"state":"COMMENTED","body":"<!-- review-anvil-marker: accepted -->\nThe earlier concern does not apply.\n\n<details>\n<summary>Earlier feedback</summary>\n\n- **author-explanation-accepted** — [medium] auth — Refresh accepts missing state. https://example.invalid/author-reply (`RAV-RUN5-R1-F001`)\n\n</details>\n\n_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._","url":"https://example.invalid/accepted-review"}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    cat >"$report" <<'REPORT'
+# review-anvil report
+
+## Findings
+- **RAV-RUN5-R1-F001 [medium] auth** `src/auth.ts:12` — Refresh accepts missing state after the caller changed.
+<!-- review-anvil: prior_feedback=reintroduced -->
+REPORT
+    cat >"$report.inline.json" <<'JSON'
+[
+  {
+    "path": "src/auth.ts",
+    "line": 12,
+    "side": "RIGHT",
+    "severity": "medium",
+    "prior_feedback": "reintroduced",
+    "body": "Refresh accepts missing state after the caller changed.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=medium area=auth -->"
+  }
+]
+JSON
+
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/dev/null
+
+    jq -e '
+      (.comments | length) == 1
+      and (.comments[0].body | contains("prior_feedback=reintroduced"))
+      and (.body | contains("Refresh accepts missing state after the caller changed."))
+    ' "$tmp/review-payload.json" >/dev/null
+}
+
+test_hidden_identity_outranks_rewritten_prose() {
+    local tmp bin fixture report inline f001_line f002_line earlier_line
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[
+    {"isResolved":false,"isOutdated":false,"path":"src/auth.ts","line":12,"comments":{"nodes":[
+      {"body":"**Stale tokens can create sessions**\n\nThe old request can rotate the session before validation.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=medium area=auth -->","url":"https://example.invalid/open"}
+    ]}}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    inline="$tmp/report.md.inline.json"
+    cat >"$report" <<'REPORT'
+# review-anvil report
+
+## Findings
+- **RAV-RUN5-R1-F001 [medium] auth** `src/auth.ts:12` — Session rotation runs before state validation.
+- **RAV-RUN5-R1-F002 [medium] auth** `src/auth.ts:12` — Stale tokens can create sessions.
+REPORT
+    cat >"$inline" <<'JSON'
+[
+  {
+    "path": "src/auth.ts",
+    "line": 12,
+    "side": "RIGHT",
+    "severity": "medium",
+    "body": "**Session rotation runs before state validation**\n\nThe handler mutates the session before it checks the state token.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F001 severity=medium area=auth -->"
+  },
+  {
+    "path": "src/auth.ts",
+    "line": 12,
+    "side": "RIGHT",
+    "severity": "medium",
+    "body": "**Stale tokens can create sessions**\n\nThe old request can rotate the session before validation.\n\n<!-- review-anvil: id=RAV-RUN5-R1-F002 severity=medium area=auth -->"
+  }
+]
+JSON
+    printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$tmp/report.md.approval.json"
+
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-hidden-identity "$report" \
+      >/tmp/review-anvil-hidden-identity.out
+
+    jq -e '.comments | length == 1' "$tmp/review-payload.json" >/dev/null
+    jq -e '.comments[0].body | contains("id=RAV-RUN5-R1-F002")' "$tmp/review-payload.json" >/dev/null
+    jq -e '.comments[0].body | contains("id=RAV-RUN5-R1-F001") | not' "$tmp/review-payload.json" >/dev/null
+    jq -r '.body' "$tmp/review-payload.json" >"$tmp/review-body.md"
+    f001_line="$(grep -nF 'RAV-RUN5-R1-F001' "$tmp/review-body.md" | cut -d: -f1)"
+    f002_line="$(grep -nF 'RAV-RUN5-R1-F002' "$tmp/review-body.md" | cut -d: -f1)"
+    earlier_line="$(grep -nF '<summary>Earlier feedback</summary>' "$tmp/review-body.md" | cut -d: -f1)"
+    [[ -n "$f001_line" && -n "$f002_line" && -n "$earlier_line" ]]
+    (( f002_line < earlier_line && earlier_line < f001_line ))
+}
+
+test_post_review_success() {
+    local tmp bin report inline
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+
+    report="$tmp/report.md"
+    inline="$tmp/report.md.inline.json"
+    make_report "$report"
+    make_inline "$inline"
+    printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$tmp/report.md.approval.json"
+
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    REVIEW_ANVIL_SKIP_DISMISSED=1 \
+    REVIEW_ANVIL_GITHUB_MAX_CHARS=500 \
+    REVIEW_ANVIL_INLINE_MAX_CHARS=220 \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/tmp/review-anvil-post.out
+
+    jq -e '.event == "COMMENT"' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("review-anvil-marker: marker-123")' "$tmp/review-payload.json" >/dev/null
+    jq -e --arg line "$REPRODUCTION_LINE" '.body | split("\n") | index($line)' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("Adversarial review")' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("github.com/mrshu/agent-skills/#review-anvil")' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("finding 01 has a long explanation that should post in full")' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("<details>\n<summary>Run details</summary>")' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("- Mix: 2 codex-exec + 1 claude-exec\n\n</details>")' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("Compact GitHub summary") | not' "$tmp/review-payload.json" >/dev/null
+    jq -e '.comments | length == 2' "$tmp/review-payload.json" >/dev/null
+    jq -e '.comments[] | has("severity") | not' "$tmp/review-payload.json" >/dev/null
+    jq -e '.comments[] | has("suggestion") | not' "$tmp/review-payload.json" >/dev/null
+    jq -e '.comments[0].body | contains("```suggestion")' "$tmp/review-payload.json" >/dev/null
+    jq -e '.comments[0].body | contains("preserve it without losing the core point")' "$tmp/review-payload.json" >/dev/null
+    jq -e '.comments[0].body | contains("without...") | not' "$tmp/review-payload.json" >/dev/null
+    jq -e '[.comments[].path] | index("README.md") | not' "$tmp/review-payload.json" >/dev/null
+    assert_file_missing "$report"
+    assert_file_missing "$inline"
+    assert_file_missing "$tmp/report.md.approval.json"
+}
+test_post_approval_body_only_retains_inline_details() {
+    local tmp bin report inline
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+
+    report="$tmp/report.md"
+    inline="$tmp/report.md.inline.json"
+    make_report "$report"
+    make_inline "$inline"
+    printf '{"event":"APPROVE","head_sha":"head-sha","adversarial_mode":"targeted","approval_allowed":true}\n' >"$tmp/report.md.approval.json"
+
+    GH_MOCK_INLINE_REVIEW_FAIL=1 \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/tmp/review-anvil-body-approval.out
+
+    jq -e '.event == "APPROVE"' "$tmp/review-payload.json" >/dev/null
+    jq -e '.comments | length == 0' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("<summary>Finding details</summary>")' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("<summary>Finding details (") | not' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("Move state validation before session rotation")' "$tmp/review-payload.json" >/dev/null
+    assert_file_missing "$report"
+    assert_file_missing "$inline"
+}
+test_post_head_move_note_stays_collapsed() {
+    local tmp bin report inline
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+
+    report="$tmp/report.md"
+    inline="$tmp/report.md.inline.json"
+    make_report "$report"
+    make_inline "$inline"
+    printf '{"event":"APPROVE","head_sha":"old-sha","adversarial_mode":"targeted","approval_allowed":true}\n' >"$report.approval.json"
+
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/tmp/review-anvil-head-move.out
+
+    jq -e '.event == "COMMENT"' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("<summary>Review context</summary>")' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("The newer commits were not reviewed.")' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("\n\n---\n\n_review-anvil selected APPROVE") | not' "$tmp/review-payload.json" >/dev/null
+}
+
+test_post_approval_rejection_note_stays_collapsed() {
+    local tmp bin report inline
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+
+    report="$tmp/report.md"
+    inline="$tmp/report.md.inline.json"
+    make_report "$report"
+    make_inline "$inline"
+    printf '{"event":"APPROVE","head_sha":"head-sha","adversarial_mode":"targeted","approval_allowed":true}\n' >"$report.approval.json"
+
+    GH_MOCK_APPROVE_FAIL=1 \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/tmp/review-anvil-approval-rejection.out
+
+    jq -e '.event == "COMMENT"' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("<summary>Review context</summary>")' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("GitHub rejected the approval")' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("\n\n---\n\n_review-anvil selected APPROVE") | not' "$tmp/review-payload.json" >/dev/null
+}
+
+
+
+test_post_fallback_comment() {
+    local tmp bin report inline
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+
+    report="$tmp/report.md"
+    inline="$tmp/report.md.inline.json"
+    make_report "$report"
+    make_inline "$inline"
+    printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$tmp/report.md.approval.json"
+
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    GH_MOCK_REVIEW_FAIL=1 \
+    REVIEW_ANVIL_SKIP_DISMISSED=1 \
+    REVIEW_ANVIL_GITHUB_MAX_CHARS=500 \
+    REVIEW_ANVIL_INLINE_MAX_CHARS=220 \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/tmp/review-anvil-fallback.out
+
+    grep -q 'review-anvil-marker: marker-123' "$tmp/comment.md"
+    grep -Fxq "$REPRODUCTION_LINE" "$tmp/comment.md"
+    grep -q 'Adversarial review' "$tmp/comment.md"
+    grep -q 'github.com/mrshu/agent-skills/#review-anvil' "$tmp/comment.md"
+    grep -q 'finding 01' "$tmp/comment.md"
+    grep -q 'Non-Blocking Notes' "$tmp/comment.md"
+    ! grep -q 'Compact GitHub summary' "$tmp/comment.md"
+    grep -q '<summary>Finding details</summary>' "$tmp/comment.md"
+    ! grep -q '<summary>Finding details (' "$tmp/comment.md"
+    grep -q 'Move state validation before session rotation' "$tmp/comment.md"
+    assert_file_missing "$report"
+    assert_file_missing "$inline"
+    assert_file_missing "$tmp/report.md.approval.json"
+}
+
+test_post_start_uses_short_declarative_comment() {
+    local tmp bin stdout
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    stdout="$tmp/stdout"
+
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    GH_MOCK_START_COMMENT=1 \
+    PATH="$bin:$PATH" \
+      "$HELPER" post-start github.com acme widgets 42 marker-123 octocat >"$stdout"
+
+    grep -Fxq 'review-anvil-improve-pr started on this PR. cc @octocat.' "$tmp/comment.md"
+    grep -Fxq 'Review agents will inspect this PR against its base branch.' "$tmp/comment.md"
+    grep -Fxq 'Fix commits will be applied to this branch after checks pass.' "$tmp/comment.md"
+    grep -Fxq 'This comment will contain the final report or a failure summary.' "$tmp/comment.md"
+    grep -Fxq 'COMMENT_ID=456' "$stdout"
+}
+
+test_post_update_success() {
+    local tmp bin report inline
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+
+    report="$tmp/report.md"
+    inline="$tmp/report.md.inline.json"
+    make_compact_report "$report"
+    make_inline "$inline"
+    printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$tmp/report.md.approval.json"
+
+    GH_MOCK_PATCH_PAYLOAD="$tmp/patch.json" \
+    REVIEW_ANVIL_SKIP_DISMISSED=1 \
+    REVIEW_ANVIL_GITHUB_MAX_CHARS=500 \
+    REVIEW_ANVIL_INLINE_MAX_CHARS=220 \
+    PATH="$bin:$PATH" \
+      "$HELPER" post-update github.com acme widgets 42 123 marker-123 "$report" octocat success 2026-06-19T00:00:00Z >/tmp/review-anvil-update.out
+
+    jq -e '.body | capture("^<!-- review-anvil-marker: marker-123 -->\\n(?<summary>[^\\n]+)") | .summary == "A state-validation issue and a write-accounting issue remain."' "$tmp/patch.json" >/dev/null
+    jq -e '.body | contains("review-anvil selected APPROVE") | not' "$tmp/patch.json" >/dev/null
+    jq -e '.body | contains("review-anvil-marker: marker-123")' "$tmp/patch.json" >/dev/null
+    jq -e --arg line "$REPRODUCTION_LINE" '.body | split("\n") | index($line)' "$tmp/patch.json" >/dev/null
+    jq -e '.body | contains("Adversarial review")' "$tmp/patch.json" >/dev/null
+    jq -e '.body | contains("github.com/mrshu/agent-skills/#review-anvil")' "$tmp/patch.json" >/dev/null
+    jq -e '.body | contains("Compact GitHub summary") | not' "$tmp/patch.json" >/dev/null
+    jq -e '.body | contains("<summary>Finding details</summary>")' "$tmp/patch.json" >/dev/null
+    jq -e '.body | contains("<summary>Finding details (") | not' "$tmp/patch.json" >/dev/null
+    jq -e '.body | contains("Move state validation before session rotation")' "$tmp/patch.json" >/dev/null
+    jq -e '.body | contains("Delivery: review-anvil-improve-pr completed")' "$tmp/patch.json" >/dev/null
+    jq -e '.body | index("<summary>Review context</summary>") < index("Delivery: review-anvil-improve-pr completed")' "$tmp/patch.json" >/dev/null
+    jq -e '.body | contains("Started: 2026-06-19T00:00:00Z; Completed:")' "$tmp/patch.json" >/dev/null
+    jq -e '.body | rtrimstr("\n") | endswith("_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._")' "$tmp/patch.json" >/dev/null
+    jq -e '.body | index("review-anvil: appended-inline-details") < index("_Reviewed with [review-anvil]")' "$tmp/patch.json" >/dev/null
+    assert_file_missing "$report"
+    assert_file_missing "$inline"
+    assert_file_missing "$tmp/report.md.approval.json"
+}
+test_post_update_refresh_failure_omits_inline_details() {
+    local tmp bin report inline
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+
+    report="$tmp/report.md"
+    inline="$tmp/report.md.inline.json"
+    make_report "$report"
+    make_inline "$inline"
+    printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$tmp/report.md.approval.json"
+
+    GH_MOCK_GRAPHQL_FAIL=1 \
+    GH_MOCK_PATCH_PAYLOAD="$tmp/patch.json" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post-update github.com acme widgets 42 123 marker-123 "$report" octocat success 2026-06-19T00:00:00Z >/tmp/review-anvil-update-failure.out
+
+    jq -e '.body | contains("review-anvil-improve-pr **failed** on this PR. cc @octocat.")' "$tmp/patch.json" >/dev/null
+    jq -e '.body | contains("prior-feedback refresh failed")' "$tmp/patch.json" >/dev/null
+    jq -e '.body | contains("<summary>Finding details") | not' "$tmp/patch.json" >/dev/null
+    jq -e '.body | contains("Move state validation before session rotation") | not' "$tmp/patch.json" >/dev/null
+    jq -e '.body | rtrimstr("\n") | endswith("_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._")' "$tmp/patch.json" >/dev/null
+    jq -e '.body | index("<summary>Review context</summary>") < index("prior-feedback refresh failed")' "$tmp/patch.json" >/dev/null
+    assert_file_missing "$report"
+    assert_file_missing "$inline"
+    assert_file_missing "$tmp/report.md.approval.json"
+}
+
+
+test_post_adversarial_off_downgrades_approval() {
+    local tmp bin report inline
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+
+    report="$tmp/report.md"
+    inline="$tmp/report.md.inline.json"
+    make_report "$report"
+    make_inline "$inline"
+    printf '{"event":"APPROVE","head_sha":"head-sha","adversarial_mode":"off"}\n' >"$tmp/report.md.approval.json"
+
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    REVIEW_ANVIL_SKIP_DISMISSED=1 \
+    REVIEW_ANVIL_GITHUB_MAX_CHARS=500 \
+    REVIEW_ANVIL_INLINE_MAX_CHARS=220 \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/tmp/review-anvil-adversarial-off.out
+
+    jq -e '.event == "COMMENT"' "$tmp/review-payload.json" >/dev/null
+    assert_file_missing "$report"
+    assert_file_missing "$inline"
+    assert_file_missing "$tmp/report.md.approval.json"
+}
+
+test_post_dismisses_id_prefixed_report_findings() {
+    local tmp bin report dismissals
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+
+    report="$tmp/report.md"
+    dismissals="$tmp/dismissals.json"
+    make_report "$report"
+    make_dismissals "$dismissals"
+    printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$tmp/report.md.approval.json"
+
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    REVIEW_ANVIL_DISMISSALS="$dismissals" \
+    REVIEW_ANVIL_GITHUB_MAX_CHARS=12000 \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/tmp/review-anvil-dismissed-id.out
+
+    grep -q 'Earlier feedback' "$tmp/comment.md"
+    ! grep -Fq 'RAV-RUN3-R2-F001 [medium] auth' "$tmp/comment.md"
+    grep -q 'local-test-dismissal' "$tmp/comment.md"
+    assert_file_missing "$report"
+    assert_file_missing "$tmp/report.md.approval.json"
+}
+
+test_compact_report_preserves_body_losslessly() {
+    local tmp report expected
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    report="$tmp/report.md"
+    expected="$tmp/expected.md"
+    {
+        printf '# ⚒️ review-anvil report\n\n'
+        printf '**Result:** legacy ID compatibility fixture.\n\n'
+        printf '## Findings\n'
+        printf '| ID | Sev | Area | Location | Finding |\n'
+        printf '|---|---|---|---|---|\n'
+        printf '| RAVF001 | H | db | `src/db.ts:8` | table rows stay in the full report. |\n'
+        printf -- '- **F-001 [medium] auth** `src/auth.ts:12` — dashed legacy IDs stay untouched.\n'
+        printf '\n## Fixes / Would Apply\n'
+        printf -- '- **RAVW001 [medium] auth** — would commit as `fix(auth): validate state`; covers RAVF001\n'
+        printf '\n## Deferred / Out-of-Scope\n'
+        printf -- '- **W-001 [medium] config** — legacy would-apply IDs stay untouched.\n'
+    } >"$report"
+    cp "$report" "$expected"
+
+    REVIEW_ANVIL_GITHUB_MAX_CHARS=1 "$HELPER" compact-report "$report" >/tmp/review-anvil-legacy-compact.out
+
+    cmp -s "$expected" "$report"
+    [[ ! -e "$report.full.md" ]] || fail "compact-report should not create a full-copy artifact"
+}
+
+test_compact_report_preserves_invalid_and_fenced_text() {
+    local tmp report expected
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    report="$tmp/report.md"
+    expected="$tmp/expected.md"
+    {
+        printf '# ⚒️ review-anvil report\n\n'
+        printf '**Result:** invalid ID fixture.\n\n'
+        printf '## Misc\n'
+        printf -- '- **F001 [high] db** — bare transitional IDs are not findings.\n'
+        printf -- '- **F1 [high] auth** — short IDs are not findings.\n'
+        printf -- '- **RAVF-001 [high] api** — dashed RAV IDs are not findings.\n'
+        printf -- '- **RAV-RUN0-R2-F001 [high] provenance** — run zero is not a finding.\n'
+        printf -- '- **RAV-RUN3-R0-F001 [high] provenance** — round zero is not a finding.\n'
+        printf -- '- **RAV-RUN3-R2-F000 [high] provenance** — finding zero is not a finding.\n'
+        printf -- '- **RAV-RUN3-R2-P001 [high] provenance** — plan IDs are not findings.\n'
+        printf '```md\n'
+        printf -- '- **RAV-RUN3-R2-F999 [high] fenced** — fenced examples are not findings.\n'
+        printf '```\n'
+    } >"$report"
+    cp "$report" "$expected"
+
+    REVIEW_ANVIL_GITHUB_MAX_CHARS=1 "$HELPER" compact-report "$report" >/tmp/review-anvil-invalid-compact.out
+
+    cmp -s "$expected" "$report"
+}
+
+test_compact_report_preserves_wrapped_reproduction_metadata() {
+    local tmp report expected
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    report="$tmp/report.md"
+    expected="$tmp/expected.md"
+    {
+        printf '# ⚒️ review-anvil report\n\n'
+        printf '**Result:** wrapped metadata fixture.\n'
+        printf '**Reproduction:** 4 candidates; 3 confirmed, 1 deferred after\n'
+        printf 'failed reproduction.\n\n'
+        printf '## Findings\n'
+        printf -- '- **RAV-RUN3-R2-F001 [medium] auth** `src/auth.ts:12` — wrapped metadata should stay exactly as generated.\n'
+    } >"$report"
+    cp "$report" "$expected"
+
+    REVIEW_ANVIL_GITHUB_MAX_CHARS=1 "$HELPER" compact-report "$report" >/tmp/review-anvil-wrapped-reproduction.out
+
+    cmp -s "$expected" "$report"
+}
+
+test_post_dismisses_table_report_findings() {
+    local tmp bin report dismissals
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+
+    report="$tmp/report.md"
+    dismissals="$tmp/dismissals.json"
+    {
+        printf '# ⚒️ review-anvil report\n\n'
+        printf '**Review decision:** COMMENT — table finding needs attention.\n\n'
+        printf '## Findings\n'
+        printf '| ID | Sev | Area | Location | Finding |\n'
+        printf '|---|---|---|---|---|\n'
+        printf '| RAV-RUN3-R2-F001 | M | auth | `src/auth.ts:12` | finding 01 has a long explanation that should stay intact while retaining the finding number 01 and still point to the inline comment. |\n'
+    } >"$report"
+    cat >"$dismissals" <<'JSON'
+{
+  "acme/widgets#42": [
+    {
+      "path": "src/auth.ts",
+      "pattern": "RAV-RUN3-R2-F001 [medium] auth — finding 01 has a long explanation that should stay intact while retaining the finding number 01 and still point to the inline comment.",
+      "reason": "local-table-dismissal"
+    }
+  ]
+}
+JSON
+    printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$tmp/report.md.approval.json"
+
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    REVIEW_ANVIL_DISMISSALS="$dismissals" \
+    REVIEW_ANVIL_GITHUB_MAX_CHARS=12000 \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/tmp/review-anvil-dismissed-table.out
+
+    grep -q 'Earlier feedback' "$tmp/comment.md"
+    ! grep -Fq '| RAV-RUN3-R2-F001 | M | auth | `src/auth.ts:12` |' "$tmp/comment.md"
+    grep -q 'local-table-dismissal' "$tmp/comment.md"
+    assert_file_missing "$report"
+    assert_file_missing "$tmp/report.md.approval.json"
+}
+
+test_dismissal_respects_report_paths() {
+    local tmp bin report dismissals
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+
+    report="$tmp/report.md"
+    dismissals="$tmp/dismissals.json"
+    {
+        printf '# ⚒️ review-anvil report\n\n'
+        printf '**Review decision:** COMMENT — same text in another file remains actionable.\n\n'
+        printf '## Findings\n'
+        printf -- '- **RAV-RUN3-R2-F001 [medium] auth** `src/other.ts:12` — same summary text appears in another file.\n'
+    } >"$report"
+    cat >"$dismissals" <<'JSON'
+{
+  "acme/widgets#42": [
+    {
+      "path": "src/auth.ts",
+      "pattern": "RAV-RUN3-R2-F001 [medium] auth — same summary text appears in another file.",
+      "reason": "local-path-dismissal"
+    }
+  ]
+}
+JSON
+    printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$tmp/report.md.approval.json"
+
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    REVIEW_ANVIL_DISMISSALS="$dismissals" \
+    REVIEW_ANVIL_GITHUB_MAX_CHARS=12000 \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/tmp/review-anvil-path-dismissal.out
+
+    ! grep -q 'Prior PR feedback status' "$tmp/comment.md"
+    grep -Fq 'same summary text appears in another file' "$tmp/comment.md"
+    assert_file_missing "$report"
+    assert_file_missing "$tmp/report.md.approval.json"
+}
+
+test_next_run_counts_distinct_finalized_reports() {
+    local tmp bin fixture output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[
+    {"state":"COMMENTED","body":"<!-- review-anvil-marker: run-a -->\n# ⚒️ review-anvil report","url":"https://example.invalid/a"},
+    {"state":"COMMENTED","body":"# review-anvil report","url":"https://example.invalid/legacy"},
+    {"state":"COMMENTED","body":"<!-- review-anvil-marker: run-c -->\nThe refresh path can create an invalid session.\n\n<details>\n<summary>Issues and fixes</summary>\n\n| Severity | Location | Issue | Suggested change |\n|---|---|---|---|\n| Medium | `src/auth.py:12` | The refresh path can create an invalid session. | Validate state first. <!-- review-anvil-report: id=RAV-RUN4-R1-F001 severity=medium area=auth path=src%2Fauth.py start_line=- line=12 disposition=active --> |\n\n</details>","url":"https://example.invalid/c"},
+    {"state":"COMMENTED","body":"# Review","url":"https://example.invalid/unrelated"},
+    {"state":"PENDING","body":"<!-- review-anvil-marker: pending -->\n# review-anvil report","url":"https://example.invalid/pending"}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[
+    {"body":"<!-- review-anvil-marker: run-a -->\n# ⚒️ review-anvil report","url":"https://example.invalid/a-copy"},
+    {"body":"<!-- review-anvil-marker: run-b -->\nreview-anvil-improve-pr failed on this PR.\n\n# ⚒️ review-anvil report","url":"https://example.invalid/b"},
+    {"body":"<!-- review-anvil-marker: run-d -->\nThis looks ready to merge.\n\n<details>\n<summary>Review context</summary>\n\n_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._\n\n</details>","url":"https://example.invalid/d"},
+    {"body":"<!-- review-anvil-marker: started -->\nreview-anvil-improve-pr started on this PR.","url":"https://example.invalid/started"}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+
+    output="$(GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" next-run github.com acme widgets 42)"
+    [[ "$output" == "6" ]] || fail "expected next run 6, got $output"
+}
+
+test_next_run_degrades_gracefully_when_history_is_unavailable() {
+    local tmp bin output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+
+    output="$(GH_MOCK_GRAPHQL_FAIL=1 PATH="$bin:$PATH" \
+      "$HELPER" next-run github.com acme widgets 42)"
+    [[ "$output" == "unavailable" ]] \
+      || fail "expected unavailable next run, got $output"
+}
+
+test_next_run_skips_graphql_in_degraded_mode() {
+    local tmp bin output warning call_marker
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    call_marker="$tmp/gh-called"
+    cat >"$bin/gh" <<'GH'
+#!/usr/bin/env bash
+set -euo pipefail
+touch "$GH_CALL_MARKER"
+printf 'fake gh must not be called in degraded mode\n' >&2
+exit 97
+GH
+    chmod +x "$bin/gh"
+
+    output="$tmp/output.txt"
+    warning="$tmp/warning.txt"
+    GH_CALL_MARKER="$call_marker" \
+    REVIEW_ANVIL_SKIP_DISMISSED=1 \
+    PATH="$bin:$PATH" \
+      "$HELPER" next-run github.com acme widgets 42 >"$output" 2>"$warning"
+
+    [[ "$(cat "$output")" == "unavailable" ]] \
+      || fail "expected unavailable next run in degraded mode"
+    grep -Fq 'PR run ordinal unavailable; REVIEW_ANVIL_SKIP_DISMISSED=1 enables degraded mode; IDs will omit RUN' "$warning"
+    [[ ! -e "$call_marker" ]] \
+      || fail "next-run invoked GraphQL despite REVIEW_ANVIL_SKIP_DISMISSED=1"
+}
+
+test_history_includes_open_resolved_outdated_and_summary_only() {
+    local tmp bin fixture output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{
+  "data": {"repository": {"pullRequest": {
+    "reviewThreads": {
+      "nodes": [
+        {"isResolved": true, "isOutdated": false, "path": "src/auth.ts", "line": 12,
+         "comments": {"nodes": [{"body": "**[high] auth** — Refresh accepts missing state.", "url": "https://example.invalid/resolved"}]}},
+        {"isResolved": false, "isOutdated": true, "path": "src/db.ts", "line": 8,
+         "comments": {"nodes": [{"body": "**[medium] db** — Retry accounting commits before the write.", "url": "https://example.invalid/open"}]}}
+      ],
+      "pageInfo": {"hasNextPage": false, "endCursor": null}
+    },
+    "reviews": {
+      "nodes": [
+        {"state": "COMMENTED", "body": "<!-- review-anvil-marker: old -->\n# review-anvil report\n\n## Findings\n- **RAV-RUN3-R2-F001 [low] docs** `README.md:4` — CLI help omits the timeout default.\n\n## Fixes / Would Apply\n- **RAVW001 [medium] auth** — would add a helper.\n\n```md\n- **RAV-RUN3-R2-F999 [high] fenced** — example only.\n```", "url": "https://example.invalid/review"},
+        {"state": "PENDING", "body": "<!-- review-anvil-marker: pending -->\n## Findings\n- **RAV-RUN3-R2-F002 [high] hidden** — pending review is not shown.", "url": "https://example.invalid/pending"}
+      ],
+      "pageInfo": {"hasNextPage": false, "endCursor": null}
+    },
+    "comments": {"nodes": [{"body": "<!-- review-anvil-marker: fallback -->\n# review-anvil report\n\n## Suggestions\n- **[low] cli** — fallback comment finding.", "url": "https://example.invalid/comment"}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+  }}}}
+JSON
+
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+
+    grep -Fq '[resolved] src/auth.ts:12' "$output"
+    grep -Fq '[open,outdated] src/db.ts:8' "$output"
+    grep -Fq '[reported] README.md:4' "$output"
+    grep -Fq 'CLI help omits the timeout default' "$output"
+    grep -Fq 'fallback comment finding' "$output"
+    ! grep -Fq 'would add a helper' "$output"
+    ! grep -Fq 'example only' "$output"
+    ! grep -Fq 'pending review is not shown' "$output"
+}
+
+test_history_parses_provenance_ids_and_rejects_malformed_tokens() {
+    local tmp bin fixture output summary_line fenced_line
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{
+  "data": {"repository": {"pullRequest": {
+    "reviewThreads": {
+      "nodes": [
+        {"isResolved": false, "isOutdated": false, "path": "docs/summary.md", "line": 5,
+         "comments": {"nodes": [{"body": "RAV-R3-F005 [low] docs — Summary bodies preserve finding identity even when prose says id=RAV-R9-F999-extra.", "url": "https://example.invalid/summary"}]}},
+        {"isResolved": false, "isOutdated": false, "path": "docs/fenced.md", "line": 6,
+         "comments": {"nodes": [{"body": "[low] docs — Real finding has no ID.\n\n```md\nRAV-R3-F777 [low] example — fenced identifier only.\n```", "url": "https://example.invalid/fenced"}]}}
+      ],
+      "pageInfo": {"hasNextPage": false, "endCursor": null}
+    },
+    "reviews": {
+      "nodes": [
+        {"state": "COMMENTED", "body": "<!-- review-anvil-marker: new -->\n# review-anvil report\n\n## What I noticed\n- **RAV-RUN3-R2-F001 [medium] auth** `src/auth.ts:12` — A stale token can create a session.\n- **RAV-RUN0-R2-F001 [high] invalid** `src/invalid-run.ts:1` — Run zero must not parse.\n- **RAV-RUN3-R0-F001 [high] invalid** `src/invalid-round.ts:1` — Round zero must not parse.\n- **RAV-RUN3-R2-F000 [high] invalid** `src/invalid-finding.ts:1` — Finding zero must not parse.\n- **RAV-RUN3-R2-P001 [high] invalid** `src/plan.ts:1` — Plan IDs must not parse as findings.\n\n## Set aside / Outside this change\n- **RAV-R3-F002 [low] docs** `README.md:4` — The wording needs a product decision.", "url": "https://example.invalid/new-review"}
+      ],
+      "pageInfo": {"hasNextPage": false, "endCursor": null}
+    },
+    "comments": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+  }}}}
+JSON
+
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+
+    grep -Fq '[reported] src/auth.ts:12' "$output"
+    grep -Fq 'id=RAV-RUN3-R2-F001' "$output"
+    grep -Fq '[deferred] README.md:4' "$output"
+    grep -Fq 'id=RAV-R3-F002' "$output"
+    summary_line="$(grep -F '[open] docs/summary.md:5' "$output")"
+    [[ "$summary_line" == *'; id=RAV-R3-F005)'* ]]
+    fenced_line="$(grep -F '[open] docs/fenced.md:6' "$output")"
+    [[ "$fenced_line" != *'; id='* ]]
+    ! grep -Fq 'Run zero must not parse' "$output"
+    ! grep -Fq 'Round zero must not parse' "$output"
+    ! grep -Fq 'Finding zero must not parse' "$output"
+    ! grep -Fq 'Plan IDs must not parse as findings' "$output"
+}
+
+test_history_parses_clarity_report_findings() {
+    local tmp bin fixture output medium_line low_line deferred_line fixed_line stale_line no_id_line human_line human_optional human_deferred human_outside
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{
+  "data": {"repository": {"pullRequest": {
+    "reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+    "reviews": {
+      "nodes": [
+        {
+          "state": "COMMENTED",
+          "body": "<!-- review-anvil-marker: older-active -->\n# review-anvil report\n\n## Findings\n- **RAV-RUN1-R1-F009 [medium] history** `src/old.ts:4` — Older active text.",
+          "url": "https://example.invalid/older-active"
+        },
+        {
+          "state": "COMMENTED",
+          "body": "<!-- review-anvil-marker: clarity-report -->\n# Review result\n\n**Review decision:** COMMENT — One issue remains.\n\n## Needs attention\n\n- **Refresh creates a session before CSRF validation** `src/auth.ts:12` — An invalid token can create a session. Check the token first. (`RAV-RUN3-R2-F001`) <!-- review-anvil-report: severity=medium area=auth -->\n\n<details>\n<summary>Non-blocking findings (1)</summary>\n\n- **CLI help omits the timeout default** `docs/cli.md:7` — Consider naming the default. (`RAV-RUN3-R2-F002`) <!-- review-anvil-report: severity=low area=docs -->\n\n</details>\n\n<details>\n<summary>Set aside / Outside this change (1)</summary>\n\n- **The runtime path remains unconfirmed** `src/runtime.ts:9` — Set aside because the failing path could not be confirmed. (`RAV-RUN3-R2-F003`) <!-- review-anvil-report: severity=medium area=runtime -->\n\n</details>\n\n<details>\n<summary>Earlier review comments (2)</summary>\n\n- **fixed** — Fixed earlier item. https://example.invalid/fixed (`RAV-RUN1-R1-F009`)\n- **stale** — Stale earlier item. https://example.invalid/stale (`RAVF007`)\n\n</details>",
+          "url": "https://example.invalid/clarity-report"
+        },
+        {
+          "state": "COMMENTED",
+          "body": "<!-- review-anvil-marker: clarity-no-id -->\n# Review result\n\n<details>\n<summary>Earlier review comments (1)</summary>\n\n- **reported** — Unidentified earlier item. https://example.invalid/no-id\n\n</details>",
+          "url": "https://example.invalid/clarity-no-id"
+        },
+        {
+          "state": "COMMENTED",
+          "body": "<!-- review-anvil-marker: human-report -->\nThe CLI entry point still uses the old parser and fails before conversion.\n\n<details>\n<summary>Issues and fixes</summary>\n\n| Severity | Location | Issue | Suggested change |\n|---|---|---|---|\n| Medium | `every_eval_ever/cli.py:383` | The CLI entry point still uses the old parser. | Use the shared top-level parser. <!-- review-anvil-report: id=RAV-RUN4-R1-F030 severity=medium area=cli path=every_eval_ever/cli.py start_line=- line=383 disposition=active --> |\n\n</details>\n\n<details>\n<summary>Optional suggestions</summary>\n\n| Severity | Location | Suggestion | Suggested change |\n|---|---|---|---|\n| Low | `docs/help.md:5` | The help could name the default. | Consider naming it. <!-- review-anvil-report: id=RAV-RUN4-R1-F033 severity=low area=docs path=docs/help.md start_line=- line=5 disposition=active --> |\n\n</details>\n\n<details>\n<summary>Set aside</summary>\n\n- I set one runtime concern aside because it needs a reproducible case. <!-- review-anvil-report: id=RAV-RUN4-R1-F031 severity=low area=runtime path=- start_line=- line=- disposition=deferred -->\n\n</details>\n\n<details>\n<summary>Outside this change</summary>\n\n- This documentation concern belongs to another change. <!-- review-anvil-report: id=RAV-RUN4-R1-F032 severity=low area=docs path=docs/other.md start_line=- line=4 disposition=outside -->\n\n</details>\n\n<details>\n<summary>Review context</summary>\n\nThe exact run details remain collapsed.\n\n</details>",
+          "url": "https://example.invalid/human-report"
+        }
+      ],
+      "pageInfo": {"hasNextPage": false, "endCursor": null}
+    },
+    "comments": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+  }}}
+}
+JSON
+
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+
+    medium_line="$(grep -F '[reported] src/auth.ts:12' "$output")"
+    [[ "$medium_line" == *'[medium] auth — Refresh creates a session before CSRF validation'* ]]
+    [[ "$medium_line" == *'; id=RAV-RUN3-R2-F001)'* ]]
+    low_line="$(grep -F '[reported] docs/cli.md:7' "$output")"
+    [[ "$low_line" == *'[low] docs — CLI help omits the timeout default'* ]]
+    [[ "$low_line" == *'; id=RAV-RUN3-R2-F002)'* ]]
+    fixed_line="$(grep -F '[fixed] src/old.ts:4' "$output")"
+    [[ "$fixed_line" == *'Fixed earlier item.'* ]]
+    [[ "$fixed_line" == *'source=https://example.invalid/fixed'* ]]
+    [[ "$fixed_line" == *'; id=RAV-RUN1-R1-F009)'* ]]
+    deferred_line="$(grep -F '[deferred] src/runtime.ts:9' "$output")"
+    [[ "$deferred_line" == *'[medium] runtime — The runtime path remains unconfirmed'* ]]
+    [[ "$deferred_line" == *'; id=RAV-RUN3-R2-F003)'* ]]
+    stale_line="$(grep -F '[stale] (no file anchor)' "$output")"
+    [[ "$stale_line" == *'; legacy=RAVF007)'* ]]
+    no_id_line="$(grep -F 'Unidentified earlier item.' "$output")"
+    [[ "$no_id_line" == *'[reported] (no file anchor)'* ]]
+    [[ "$no_id_line" != *'; id='* && "$no_id_line" != *'; legacy='* ]]
+    human_line="$(grep -F '[reported] every_eval_ever/cli.py:383' "$output")"
+    [[ "$human_line" == *'[medium] cli — The CLI entry point still uses the old parser.'* ]]
+    [[ "$human_line" == *'; id=RAV-RUN4-R1-F030)'* ]]
+    human_optional="$(grep -F '[reported] docs/help.md:5' "$output")"
+    [[ "$human_optional" == *'[low] docs — The help could name the default.'* ]]
+    [[ "$human_optional" == *'; id=RAV-RUN4-R1-F033)'* ]]
+    human_deferred="$(grep -F '[deferred] (no file anchor)' "$output")"
+    [[ "$human_deferred" == *'[low] runtime — I set one runtime concern aside because it needs a reproducible case.'* ]]
+    [[ "$human_deferred" == *'; id=RAV-RUN4-R1-F031)'* ]]
+    human_outside="$(grep -F '[outside] docs/other.md:4' "$output")"
+    [[ "$human_outside" == *'[low] docs — This documentation concern belongs to another change.'* ]]
+    [[ "$human_outside" == *'; id=RAV-RUN4-R1-F032)'* ]]
+}
+
+test_history_preserves_engine_generated_inline_and_grouped_ids() {
+    local tmp bin fixture output inline_line grouped_line fenced_line
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{
+  "data": {"repository": {"pullRequest": {
+    "reviewThreads": {
+      "nodes": [
+        {"isResolved": false, "isOutdated": false, "path": "src/auth.ts", "line": 12,
+         "comments": {"nodes": [{"body": "**RAV-RUN3-R2-F010 [high] auth** — Refresh accepts missing state.", "url": "https://example.invalid/generated-inline"}]}}
+      ],
+      "pageInfo": {"hasNextPage": false, "endCursor": null}
+    },
+    "reviews": {
+      "nodes": [
+        {"state": "COMMENTED", "body": "<!-- review-anvil-marker: generated-report -->\n# review-anvil report\n\n## What I noticed\n- **RAV-RUN3-R2-F011 [medium] db** `src/db.ts:8` — Retry accounting commits before the write.\n\n```md\n- **RAV-RUN3-R2-F012 [low] fenced** `docs/example.md:1` — Fenced examples are not findings.\n```", "url": "https://example.invalid/generated-report"}
+      ],
+      "pageInfo": {"hasNextPage": false, "endCursor": null}
+    },
+    "comments": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+  }}}}
+JSON
+
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+
+    inline_line="$(grep -F '[open] src/auth.ts:12' "$output")"
+    [[ "$inline_line" == *'; id=RAV-RUN3-R2-F010)'* ]] \
+      || fail "generated inline body lost RAV-RUN3-R2-F010 in history"
+    grouped_line="$(grep -F '[reported] src/db.ts:8' "$output")"
+    [[ "$grouped_line" == *'; id=RAV-RUN3-R2-F011)'* ]] \
+      || fail "generated grouped bullet lost RAV-RUN3-R2-F011 in history"
+    fenced_line="$(grep -F 'Fenced examples are not findings.' "$output" || true)"
+    [[ -z "$fenced_line" ]] || fail "fenced generated example entered history"
+}
+
+test_history_merges_duplicate_identity_into_open_thread() {
+    local tmp bin fixture output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "reviewThreads":{"nodes":[
+    {"isResolved":false,"isOutdated":false,"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**RAV-RUN2-R1-F003 [medium] auth** — Refresh accepts missing state.","url":"https://example.invalid/open"}]}}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[
+    {"state":"COMMENTED","body":"<!-- review-anvil-marker: duplicate-identity -->\n# review-anvil report\n\n## Findings\n- **RAV-RUN2-R1-F003 [medium] auth** `src/auth.ts:12` — Refresh accepts missing state.\n- **RAVF007 [medium] auth** `src/auth.ts:12` — Refresh accepts missing state.","url":"https://example.invalid/report"}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+
+    [[ "$(grep -Fc 'Refresh accepts missing state.' "$output")" -eq 1 ]]
+    grep -Fq '[open] src/auth.ts:12' "$output"
+    grep -Fq 'source=https://example.invalid/open' "$output"
+    grep -Fq 'id=RAV-RUN2-R1-F003' "$output"
+    grep -Fq 'legacy=RAVF007' "$output"
+}
+
+test_history_preserves_table_finding_identity() {
+    local tmp bin fixture output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[
+    {"state":"COMMENTED","body":"<!-- review-anvil-marker: table-identity -->\n# review-anvil report\n\n## Findings\n| ID | Sev | Area | Location | Finding |\n|---|---|---|---|---|\n| RAV-R2-F004 | M | cache | `src/cache.ts:9` | Cache misses are logged as hits. |","url":"https://example.invalid/table"}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+
+    grep -Fq '[reported] src/cache.ts:9' "$output"
+    grep -Fq 'id=RAV-R2-F004' "$output"
+}
+
+test_post_history_round_trip_preserves_modern_and_legacy_identity() {
+    local tmp bin prior_fixture next_fixture report output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    prior_fixture="$tmp/prior-history.json"
+    cat >"$prior_fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[
+    {"state":"COMMENTED","body":"<!-- review-anvil-marker: legacy-history -->\n# review-anvil report\n\n## Findings\n- **RAVF007 [medium] auth** `src/auth.ts:12` — Refresh accepts missing state _(only in strict mode)_.","url":"https://example.invalid/legacy-report"}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+
+    report="$tmp/report.md"
+    printf '# review-anvil report\n\n- **RAV-RUN3-R1-F001 [medium] auth** `src/auth.ts:12` — Refresh accepts missing state _(only in strict mode)_.\n' >"$report"
+    printf '[]\n' >"$report.inline.json"
+    printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$report.approval.json"
+
+    GH_MOCK_GRAPHQL_RESPONSE="$prior_fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/posted-comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-round-trip "$report" \
+      >/tmp/review-anvil-identity-round-trip.out
+
+    grep -Fq '<summary>Earlier feedback</summary>' "$tmp/posted-comment.md"
+    grep -Fq 'RAV-RUN3-R1-F001' "$tmp/posted-comment.md"
+
+    next_fixture="$tmp/next-history.json"
+    jq -n --rawfile body "$tmp/posted-comment.md" '
+      {data:{repository:{pullRequest:{
+        reviewThreads:{nodes:[],pageInfo:{hasNextPage:false,endCursor:null}},
+        reviews:{nodes:[{
+          state:"COMMENTED",
+          body:"<!-- review-anvil-marker: duplicate-round-trip -->\n# review-anvil report\n\n## Findings\n- **RAV-RUN3-R1-F001 [medium] auth** `src/auth.ts:12` — Refresh accepts missing state _(only in strict mode)_.",
+          url:"https://example.invalid/round-trip-duplicate"
+        }],pageInfo:{hasNextPage:false,endCursor:null}},
+        comments:{nodes:[{body:$body,url:"https://example.invalid/round-trip"}],
+                  pageInfo:{hasNextPage:false,endCursor:null}}
+      }}}}
+    ' >"$next_fixture"
+
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$next_fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+
+    grep -Fq '[reported] src/auth.ts:12' "$output"
+    grep -Fq 'id=RAV-RUN3-R1-F001' "$output"
+    grep -Fq 'legacy=RAVF007' "$output"
+    grep -Fq '_(only in strict mode)_' "$output"
+    [[ "$(grep -Fc 'Refresh accepts missing state' "$output")" -eq 1 ]]
+}
+
+test_post_history_round_trip_preserves_low_nit_and_set_aside_ids() {
+    local tmp bin empty_fixture next_fixture report output line
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    empty_fixture="$tmp/empty-history.json"
+    cat >"$empty_fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+
+    report="$tmp/report.md"
+    cat >"$report" <<'REPORT'
+# review-anvil report
+
+## What I noticed
+<details>
+<summary>Non-blocking low/nit findings</summary>
+
+- **RAV-RUN4-R2-F020 [low] docs** `docs/cli.md:7` — The CLI help uses a different option name.
+- **RAV-RUN4-R2-F021 [nit] tests** `tests/helpers.sh:11` — The duplicate fixture setup can be shared.
+
+</details>
+
+## Set aside / Outside this change
+- **RAV-RUN4-R2-F022 [low] runtime** `src/runtime.sh:18` — set aside because the failing path could not be confirmed.
+- **RAV-RUN4-R2-F023 [medium] config** `config/defaults.yml:5` — set aside after the second check: the fix is too large for a one-line default.
+- **[high] infra** `ops/deploy.yml:9` — follow-up outside this change: deployment ownership needs separate review.
+REPORT
+    printf '[]\n' >"$report.inline.json"
+    printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$report.approval.json"
+
+    GH_MOCK_GRAPHQL_RESPONSE="$empty_fixture" \
+    GH_MOCK_COMMENT_BODY="$tmp/posted-comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-generated-forms "$report" \
+      >"$tmp/post-output.txt"
+
+    next_fixture="$tmp/next-history.json"
+    jq -n --rawfile body "$tmp/posted-comment.md" '
+      {data:{repository:{pullRequest:{
+        reviewThreads:{nodes:[],pageInfo:{hasNextPage:false,endCursor:null}},
+        reviews:{nodes:[],pageInfo:{hasNextPage:false,endCursor:null}},
+        comments:{nodes:[{body:$body,url:"https://example.invalid/generated-forms"}],
+                  pageInfo:{hasNextPage:false,endCursor:null}}
+      }}}}
+    ' >"$next_fixture"
+
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$next_fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+
+    line="$(grep -F '[reported] docs/cli.md:7' "$output")"
+    [[ "$line" == *'; id=RAV-RUN4-R2-F020)'* ]] \
+      || fail "low generated form lost its original ID"
+    line="$(grep -F '[reported] tests/helpers.sh:11' "$output")"
+    [[ "$line" == *'; id=RAV-RUN4-R2-F021)'* ]] \
+      || fail "nit generated form lost its original ID"
+    line="$(grep -F '[deferred] src/runtime.sh:18' "$output")"
+    [[ "$line" == *'; id=RAV-RUN4-R2-F022)'* ]] \
+      || fail "low set-aside generated form lost its original ID"
+    line="$(grep -F '[deferred] config/defaults.yml:5' "$output")"
+    [[ "$line" == *'; id=RAV-RUN4-R2-F023)'* ]] \
+      || fail "material set-aside generated form lost its original ID"
+    line="$(grep -F '[deferred] ops/deploy.yml:9' "$output")"
+    [[ "$line" != *'; id='* ]] \
+      || fail "unassigned out-of-scope follow-up gained a finding ID"
+}
+
+test_post_suppresses_duplicate_open_thread_but_keeps_status() {
+    local tmp bin fixture report inline
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"path":"src/auth.ts","line":9,"comments":{"nodes":[{"body":"**[medium] auth** — Refresh accepts missing state.","url":"https://example.invalid/wrong-line"}]}},{"isResolved":false,"isOutdated":false,"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[medium] auth** — Refresh accepts missing state.","url":"https://example.invalid/open"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    inline="$tmp/report.md.inline.json"
+    printf '# Review result\n\n## Needs attention\n- **Refresh accepts missing state** `src/auth.ts:12` — Refresh accepts missing state. (`RAV-RUN3-R2-F001`) <!-- review-anvil-report: severity=medium area=auth -->\n' >"$report"
+    printf '[{"path":"src/auth.ts","line":12,"side":"RIGHT","severity":"medium","body":"**[medium] auth** — Refresh accepts missing state."}]\n' >"$inline"
+    printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$tmp/report.md.approval.json"
+
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/tmp/review-anvil-open-history.out
+
+    grep -Fq 'Earlier feedback' "$tmp/comment.md"
+    grep -Fq '(This is still present. Source: https://example.invalid/open; id=RAV-RUN3-R2-F001)' "$tmp/comment.md"
+    ! grep -Fq 'https://example.invalid/wrong-line' "$tmp/comment.md"
+    ! grep -Eq 'Prior PR feedback status|still-open|\*\*\(inline\)\*\*' "$tmp/comment.md"
+    [[ ! -e "$tmp/review-payload.json" ]] || jq -e '.comments | length == 0' "$tmp/review-payload.json" >/dev/null
+}
+test_compact_post_fails_closed_when_refresh_changes_inventory() {
+    local tmp bin fixture report inline
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"Refresh accepts missing state.","url":"https://example.invalid/open"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    inline="$tmp/report.md.inline.json"
+    cat >"$report" <<'REPORT'
+Refresh can accept missing state and create an invalid session.
+
+<details>
+<summary>Issues and fixes</summary>
+
+- Refresh accepts missing state. <!-- review-anvil-report: id=RAV-RUN3-R2-F001 severity=medium area=auth path=src%2Fauth.ts start_line=- line=12 disposition=active -->
+
+</details>
+
+<details>
+<summary>Review context</summary>
+
+_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._
+
+</details>
+REPORT
+    printf '[{"path":"src/auth.ts","line":12,"side":"RIGHT","severity":"medium","body":"Refresh accepts missing state.\\n\\nValidate state before refresh.\\n\\n<!-- review-anvil: id=RAV-RUN3-R2-F001 severity=medium area=auth -->"}]\n' >"$inline"
+    printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$report.approval.json"
+
+    if GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+       GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+       GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+       PATH="$bin:$PATH" \
+         "$HELPER" post github.com acme widgets 42 marker-123 "$report" \
+         >/tmp/review-anvil-compact-refresh.out 2>/tmp/review-anvil-compact-refresh.err; then
+        fail "compact post must fail when post-time history changes inventory"
+    fi
+
+    grep -Fq 'rerun review-anvil' /tmp/review-anvil-compact-refresh.err
+    grep -Fq 'Refresh can accept missing state' "$report"
+    grep -Fq 'id=RAV-RUN3-R2-F001' "$inline"
+    [[ ! -e "$tmp/review-payload.json" ]]
+}
+
+
+test_history_paginates_without_refetch_duplicates() {
+    local tmp bin output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    cat >"$bin/gh" <<'GH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ " $* " == *" threadCursor=next "* ]]; then
+  printf '%s\n' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"path":"src/two.ts","line":2,"comments":{"nodes":[{"body":"**[medium] paging** — second page finding.","url":"https://example.invalid/two"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"reviews":{"nodes":[{"body":"<!-- review-anvil-marker: old -->\n## Findings\n- **RAV-RUN3-R2-F001 [low] docs** — summary appears once.","url":"https://example.invalid/review"}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+else
+  printf '%s\n' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"path":"src/one.ts","line":1,"comments":{"nodes":[{"body":"**[high] paging** — first page finding.","url":"https://example.invalid/one"}]}}],"pageInfo":{"hasNextPage":true,"endCursor":"next"}},"reviews":{"nodes":[{"body":"<!-- review-anvil-marker: old -->\n## Findings\n- **RAV-RUN3-R2-F001 [low] docs** — summary appears once.","url":"https://example.invalid/review"}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+fi
+GH
+    chmod +x "$bin/gh"
+    output="$tmp/history.txt"
+
+    PATH="$bin:$PATH" "$HELPER" history github.com acme widgets 42 >"$output"
+
+    grep -Fq '[open] src/one.ts:1' "$output"
+    grep -Fq '[resolved] src/two.ts:2' "$output"
+    [[ "$(grep -Fc 'summary appears once' "$output")" -eq 1 ]]
+}
+
+test_local_suppression_overrides_open_history() {
+    local tmp bin fixture dismissals output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    dismissals="$tmp/dismissals.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**RAV-RUN2-R1-F003 [high] auth** — Refresh accepts missing state.","url":"https://example.invalid/open"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[{"state":"COMMENTED","body":"<!-- review-anvil-marker: legacy-suppression -->\n# review-anvil report\n\n## Findings\n- **RAVF007 [high] auth** `src/auth.ts:12` — Refresh accepts missing state.","url":"https://example.invalid/legacy"}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    cat >"$dismissals" <<'JSON'
+{"acme/widgets#42":[{"path":"src/auth.ts","pattern":"**[high] auth** — Refresh accepts missing state.","reason":"explicit-product-decision"}]}
+JSON
+    output="$tmp/history.txt"
+
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" REVIEW_ANVIL_DISMISSALS="$dismissals" \
+      PATH="$bin:$PATH" "$HELPER" history github.com acme widgets 42 >"$output"
+
+    grep -Fq '[suppressed] src/auth.ts' "$output"
+    grep -Fq 'explicit-product-decision' "$output"
+    ! grep -Fq '[open]' "$output"
+    grep -Fq 'id=RAV-RUN2-R1-F003' "$output"
+    grep -Fq 'legacy=RAVF007' "$output"
+}
+
+test_post_time_material_history_downgrades_approval() {
+    local tmp bin fixture report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/open-high"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    printf '# review-anvil report\n\n## Findings\n- **RAV-RUN3-R2-F001 [medium] db** `src/db.ts:8` — New unrelated finding.\n' >"$report"
+    printf '[{"path":"src/db.ts","line":8,"side":"RIGHT","severity":"medium","body":"**[medium] db** — New unrelated finding."}]\n' >"$report.inline.json"
+    printf '{"event":"APPROVE","head_sha":"head-sha","adversarial_mode":"targeted","approval_allowed":true}\n' >"$report.approval.json"
+
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/tmp/review-anvil-history-approval.out
+
+    jq -e '.event == "COMMENT"' "$tmp/review-payload.json" >/dev/null
+}
+
+test_outside_history_does_not_downgrade_approval() {
+    local tmp bin fixture report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[{"state":"COMMENTED","body":"<!-- review-anvil-marker: outside-high -->\n# Review\n\n<details>\n<summary>Outside this change (1)</summary>\n\n- This high-priority migration concern belongs to another change. <!-- review-anvil-report: id=RAV-RUN2-R1-F010 severity=high area=migration path=src%2Fmigration.py start_line=- line=8 disposition=outside -->\n\n</details>","url":"https://example.invalid/outside-high"}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    printf '# Review\n\n## Main issues\n- New unrelated finding. <!-- review-anvil-report: id=RAV-RUN3-R2-F001 severity=medium area=db path=src%2Fdb.ts start_line=- line=8 disposition=active -->\n' >"$report"
+    printf '[{"path":"src/db.ts","line":8,"side":"RIGHT","severity":"medium","body":"New unrelated finding.\\n\\nCould you fix it?\\n\\n<!-- review-anvil: id=RAV-RUN3-R2-F001 severity=medium area=db -->"}]\n' >"$report.inline.json"
+    printf '{"event":"APPROVE","head_sha":"head-sha","adversarial_mode":"targeted","approval_allowed":true}\n' >"$report.approval.json"
+
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report" >/tmp/review-anvil-outside-approval.out
+
+    jq -e '.event == "APPROVE"' "$tmp/review-payload.json" >/dev/null
+}
+test_author_resolved_thread_is_not_raised_again() {
+    local tmp bin fixture output report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/author-resolved"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+    grep -Fq '[author-resolved] src/auth.ts:12' "$output"
+
+    report="$tmp/report.md"
+    printf '# review-anvil report\n\n## Findings\n- **RAV-RUN3-R2-F001 [high] auth** `src/auth.ts:12` — Refresh accepts missing state.\n' >"$report"
+    printf '[{"path":"src/auth.ts","line":12,"side":"RIGHT","severity":"high","body":"**[high] auth** — Refresh accepts missing state."}]\n' >"$report.inline.json"
+    printf '{"event":"APPROVE","head_sha":"head-sha","approval_allowed":true}\n' >"$report.approval.json"
+    : >"$tmp/comment.md"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report"
+    [[ ! -e "$tmp/review-payload.json" ]] || jq -e '.comments | length == 0' "$tmp/review-payload.json" >/dev/null
+    jq -e '(.body | contains("Refresh accepts missing state") | not) and (.body | contains("Earlier feedback") | not)' "$tmp/review-payload.json" >/dev/null
+    ! grep -Fq 'Earlier feedback' "$tmp/comment.md"
+    ! grep -Fq 'Refresh accepts missing state' "$tmp/comment.md"
+    jq -e '.event == "APPROVE"' "$tmp/review-payload.json" >/dev/null
+}
+
+test_reintroduced_author_resolved_finding_is_posted_and_remains_history_actionable() {
+    local tmp bin fixture report history
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/author-resolved.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/author-resolved"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    cat >"$report" <<'REPORT'
+# review-anvil report
+
+## Findings
+- **RAV-RUN3-R2-F001 [high] auth** `src/auth.ts:12` — Refresh accepts missing state.
+- **RAV-R3-F002 [high] auth** `src/auth.ts:13` — Refresh accepts missing state.
+<!-- review-anvil: prior_feedback=reintroduced -->
+REPORT
+    cat >"$report.inline.json" <<'JSON'
+[
+  {"path":"src/auth.ts","line":12,"side":"RIGHT","severity":"high","body":"**[high] auth** — Refresh accepts missing state."},
+  {"path":"src/auth.ts","line":13,"side":"RIGHT","severity":"high","prior_feedback":"reintroduced","body":"**[high] auth** — Refresh accepts missing state."}
+]
+JSON
+    printf '{"event":"APPROVE","head_sha":"head-sha","approval_allowed":true}\n' >"$report.approval.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report"
+    jq -e '.event == "COMMENT"' "$tmp/review-payload.json" >/dev/null
+    jq -e '(.comments | length) == 1 and .comments[0].line == 13 and (.comments[0] | has("prior_feedback") | not) and (.comments[0].body | contains("<!-- review-anvil: prior_feedback=reintroduced -->"))' "$tmp/review-payload.json" >/dev/null
+    jq -e '(.body | contains("RAV-R3-F002")) and (.body | contains("RAV-RUN3-R2-F001") | not)' "$tmp/review-payload.json" >/dev/null
+
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[
+    {"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/author-resolved"}]}},
+    {"isResolved":false,"isOutdated":false,"path":"src/auth.ts","line":13,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.\n\n<!-- review-anvil: prior_feedback=reintroduced -->","url":"https://example.invalid/reintroduced"}]}}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    history="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$history"
+    grep -Fq '[open,reintroduced] src/auth.ts:13' "$history"
+    grep -Fq 'https://example.invalid/reintroduced' "$history"
+}
+test_body_only_report_reintroduction_outranks_author_resolved_history() {
+    local tmp bin fixture output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/author-resolved"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[{"state":"COMMENTED","body":"<!-- review-anvil-marker: body-only -->\n# review-anvil report\n\n## Findings\n- **RAV-R3-F002 [high] auth** `src/auth.ts:13` — Refresh accepts missing state.\n<!-- review-anvil: prior_feedback=reintroduced -->","url":"https://example.invalid/body-only-report"}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+    grep -Fq '[reported,reintroduced] src/auth.ts:13' "$output"
+    grep -Fq 'https://example.invalid/body-only-report' "$output"
+    ! grep -Fq '[author-resolved] src/auth.ts:12' "$output"
+}
+
+test_top_level_fallback_reintroduction_outranks_author_resolved_history() {
+    local tmp bin fixture output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/author-resolved"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[{"body":"<!-- review-anvil-marker: fallback-after-invalid-inline -->\n# review-anvil report\n\n## Findings\n- **RAV-R3-F002 [high] auth** `src/auth.ts:13` — Refresh accepts missing state.\n<!-- review-anvil: prior_feedback=reintroduced -->","url":"https://example.invalid/top-level-fallback"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+    grep -Fq '[reported,reintroduced] src/auth.ts:13' "$output"
+    grep -Fq 'https://example.invalid/top-level-fallback' "$output"
+    ! grep -Fq '[author-resolved] src/auth.ts:12' "$output"
+}
+
+
+test_reintroduced_medium_finding_preserves_approval() {
+    local tmp bin fixture report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/author-resolved.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/author-resolved"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    cat >"$report" <<'REPORT'
+# review-anvil report
+
+## Findings
+- **RAV-RUN3-R2-F001 [medium] auth** `src/auth.ts:13` — Refresh accepts missing state.
+<!-- review-anvil: prior_feedback=reintroduced -->
+REPORT
+    cat >"$report.inline.json" <<'JSON'
+[{"path":"src/auth.ts","line":13,"side":"RIGHT","severity":"medium","prior_feedback":"reintroduced","body":"**[medium] auth** — Refresh accepts missing state."}]
+JSON
+    printf '{"event":"APPROVE","head_sha":"head-sha","approval_allowed":true}\n' >"$report.approval.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report"
+    jq -e '.event == "APPROVE" and (.comments | length) == 1 and (.comments[0] | has("prior_feedback") | not)' "$tmp/review-payload.json" >/dev/null
+}
+
+assert_reintroduced_signal_propagates_to_both_artifacts() {
+    local report_signal="$1" inline_signal="$2" history_mode="${3:-author-resolved}" inline_field="" expected_event="COMMENT" tmp bin fixture report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir -p "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/author-resolved.json"
+    if [[ "$history_mode" == "empty" ]]; then
+        cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    else
+        cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/author-resolved"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    fi
+    if [[ "$history_mode" == "empty" ]]; then
+        expected_event="APPROVE"
+    fi
+    report="$tmp/report.md"
+    cat >"$report" <<'REPORT'
+# review-anvil report
+
+## Findings
+- **RAV-RUN3-R2-F001 [high] auth** `src/auth.ts:13` — Refresh accepts missing state.
+REPORT
+    if [[ "$report_signal" == "reintroduced" ]]; then
+        printf '<!-- review-anvil: prior_feedback=reintroduced -->\n' >>"$report"
+    fi
+    if [[ "$inline_signal" == "reintroduced" ]]; then
+        inline_field=',"prior_feedback":"reintroduced"'
+    fi
+    cat >"$report.inline.json" <<JSON
+[{"path":"src/auth.ts","line":13,"side":"RIGHT","severity":"high"${inline_field},"body":"**[high] auth** — Refresh accepts missing state."}]
+JSON
+    printf '{"event":"APPROVE","head_sha":"head-sha","approval_allowed":true}\n' >"$report.approval.json"
+    : >"$tmp/comment.md"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report"
+    jq -e --arg event "$expected_event" '.event == $event and (.comments | length) == 1 and .comments[0].line == 13 and (.comments[0].body | contains("<!-- review-anvil: prior_feedback=reintroduced -->"))' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("- **RAV-RUN3-R2-F001 [high] auth** `src/auth.ts:13` — Refresh accepts missing state.\n<!-- review-anvil: prior_feedback=reintroduced -->")' "$tmp/review-payload.json" >/dev/null
+
+    posted_body="$(jq -r '.comments[0].body' "$tmp/review-payload.json")"
+    jq -n --arg body "$posted_body" '
+      {"data":{"repository":{"pullRequest":{
+        "author":{"login":"pr-author"},
+        "reviewThreads":{"nodes":[
+          {"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/author-resolved"}]}},
+          {"isResolved":false,"isOutdated":false,"path":"src/auth.ts","line":13,"comments":{"nodes":[{"body":$body,"url":"https://example.invalid/reintroduced"}]}}
+        ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+        "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+        "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+      }}}}
+    ' >"$fixture"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$tmp/history.txt"
+    grep -Fq '[open,reintroduced] src/auth.ts:13' "$tmp/history.txt"
+}
+
+test_report_marker_reintroduction_preserves_inline_companion() {
+    assert_reintroduced_signal_propagates_to_both_artifacts reintroduced ""
+}
+
+test_inline_reintroduction_preserves_report_companion() {
+    assert_reintroduced_signal_propagates_to_both_artifacts "" reintroduced
+}
+
+test_report_marker_reintroduction_persists_without_history() {
+    assert_reintroduced_signal_propagates_to_both_artifacts reintroduced "" empty
+}
+
+test_inline_reintroduction_persists_without_history() {
+    assert_reintroduced_signal_propagates_to_both_artifacts "" reintroduced empty
+}
+assert_reintroduced_range_signal_propagates_to_both_artifacts() {
+    local report_signal="$1" inline_signal="$2" inline_field="" tmp bin fixture report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir -p "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/author-resolved.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/db.ts","line":99,"comments":{"nodes":[{"body":"**[high] db** — Write failures are reported as success.","url":"https://example.invalid/author-resolved"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    cat >"$report" <<'REPORT'
+# review-anvil report
+
+## Findings
+- **RAV-RUN3-R2-F001 [high] db** `src/db.ts:100-110` — Write failures are reported as success.
+REPORT
+    if [[ "$report_signal" == "reintroduced" ]]; then
+        printf '<!-- review-anvil: prior_feedback=reintroduced -->\n' >>"$report"
+    fi
+    if [[ "$inline_signal" == "reintroduced" ]]; then
+        inline_field=',"prior_feedback":"reintroduced"'
+    fi
+    cat >"$report.inline.json" <<JSON
+[{"path":"src/db.ts","start_line":100,"line":110,"side":"RIGHT","severity":"high"${inline_field},"body":"**[high] db** — Write failures are reported as success."}]
+JSON
+    printf '{"event":"APPROVE","head_sha":"head-sha","approval_allowed":true}\n' >"$report.approval.json"
+    : >"$tmp/comment.md"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report"
+    jq -e '.event == "COMMENT" and (.comments | length) == 1 and .comments[0].line == 110' "$tmp/review-payload.json" >/dev/null
+    jq -e '.body | contains("RAV-RUN3-R2-F001")' "$tmp/review-payload.json" >/dev/null
+}
+
+test_report_marker_range_reintroduction_preserves_inline_companion() {
+    assert_reintroduced_range_signal_propagates_to_both_artifacts reintroduced ""
+}
+
+test_inline_field_range_reintroduction_preserves_report_companion() {
+    assert_reintroduced_range_signal_propagates_to_both_artifacts "" reintroduced
+}
+
+test_position_only_reintroduction_does_not_mark_ambiguous_companions() {
+    local tmp bin fixture report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/author-resolved.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/author-resolved"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    cat >"$report" <<'REPORT'
+# review-anvil report
+
+## Findings
+- **RAV-RUN3-R2-F001 [high] auth** `src/auth.ts:13` — Refresh accepts missing state.
+<!-- review-anvil: prior_feedback=reintroduced -->
+REPORT
+    cat >"$report.inline.json" <<'JSON'
+[
+  {"path":"src/auth.ts","position":101,"severity":"high","body":"**[high] auth** — Refresh accepts missing state."},
+  {"path":"src/auth.ts","position":102,"severity":"high","body":"**[high] auth** — Refresh accepts missing state."}
+]
+JSON
+    printf '{"event":"APPROVE","head_sha":"head-sha","approval_allowed":true}\n' >"$report.approval.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report"
+    [[ ! -e "$tmp/review-payload.json" ]]
+    grep -Fq '<!-- review-anvil: prior_feedback=reintroduced -->' "$tmp/comment.md"
+}
+
+test_position_only_field_does_not_mark_ambiguous_report_companion() {
+    local tmp bin fixture report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/author-resolved.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/author-resolved"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    cat >"$report" <<'REPORT'
+# review-anvil report
+
+## Findings
+- **RAV-RUN3-R2-F001 [high] auth** `src/auth.ts:13` — Refresh accepts missing state.
+REPORT
+    cat >"$report.inline.json" <<'JSON'
+[
+  {"path":"src/auth.ts","position":101,"severity":"high","prior_feedback":"reintroduced","body":"**[high] auth** — Refresh accepts missing state."},
+  {"path":"src/auth.ts","position":102,"severity":"high","body":"**[high] auth** — Refresh accepts missing state."}
+]
+JSON
+    printf '{"event":"APPROVE","head_sha":"head-sha","approval_allowed":true}\n' >"$report.approval.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report"
+    jq -e '(.comments | length) == 1 and .comments[0].position == 101 and (.comments[0].body | contains("<!-- review-anvil: prior_feedback=reintroduced -->")) and (.body | contains("<!-- review-anvil: prior_feedback=reintroduced -->") | not)' "$tmp/review-payload.json" >/dev/null
+}
+
+test_non_author_resolved_thread_remains_revalidated() {
+    local tmp bin fixture output report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"reviewer"},"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/reviewer-resolved"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+    grep -Fq '[resolved] src/auth.ts:12' "$output"
+
+    report="$tmp/report.md"
+    printf '# review-anvil report\n\n## Findings\n- **RAV-RUN3-R2-F001 [high] auth** `src/auth.ts:12` — Refresh accepts missing state.\n' >"$report"
+    printf '{"event":"APPROVE","head_sha":"head-sha","approval_allowed":true}\n' >"$report.approval.json"
+    : >"$tmp/comment.md"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report"
+    grep -Fq 'Earlier feedback' "$tmp/comment.md"
+    grep -Fq 'Refresh accepts missing state' "$tmp/comment.md"
+}
+
+test_author_resolved_outranks_equivalent_open_history() {
+    local tmp bin fixture output report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[
+    {"isResolved":false,"isOutdated":false,"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/open"}]}},
+    {"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/author-resolved"}]}}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+    [[ "$(grep -Fc 'Refresh accepts missing state' "$output")" -eq 1 ]]
+    grep -Fq '[author-resolved] src/auth.ts:12' "$output"
+
+    report="$tmp/report.md"
+    printf '# review-anvil report\n\n## Findings\n- **RAV-RUN3-R2-F001 [high] auth** `src/auth.ts:12` — Refresh accepts missing state.\n' >"$report"
+    printf '[{"path":"src/auth.ts","line":12,"side":"RIGHT","severity":"high","body":"**[high] auth** — Refresh accepts missing state."}]\n' >"$report.inline.json"
+    printf '{"event":"APPROVE","head_sha":"head-sha","approval_allowed":true}\n' >"$report.approval.json"
+    : >"$tmp/comment.md"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report"
+    [[ ! -e "$tmp/review-payload.json" ]] || jq -e '.comments | length == 0' "$tmp/review-payload.json" >/dev/null
+    ! grep -Fq 'Earlier feedback' "$tmp/comment.md"
+    jq -e '.event == "APPROVE"' "$tmp/review-payload.json" >/dev/null
+}
+
+test_author_resolved_does_not_outrank_distinct_open_history() {
+    local tmp bin fixture output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[
+    {"isResolved":false,"isOutdated":false,"path":"src/auth.ts","line":40,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/open-distinct"}]}},
+    {"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/author-resolved"}]}}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    output="$tmp/history.txt"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" history github.com acme widgets 42 >"$output"
+    grep -Fq '[open] src/auth.ts:40' "$output"
+    grep -Fq '[author-resolved] src/auth.ts:12' "$output"
+}
+
+test_distinct_open_history_is_revalidated_when_author_resolved_comes_first() {
+    local tmp bin fixture output report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[
+    {"isResolved":true,"isOutdated":false,"resolvedBy":{"login":"pr-author"},"path":"src/auth.ts","line":40,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/author-resolved"}]}},
+    {"isResolved":false,"isOutdated":false,"path":"src/auth.ts","startLine":12,"line":40,"comments":{"nodes":[{"body":"**[high] auth** — Refresh accepts missing state.","url":"https://example.invalid/open-distinct"}]}}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    report="$tmp/report.md"
+    printf '# review-anvil report\n\n## Findings\n- **RAV-RUN3-R2-F001 [high] auth** `src/auth.ts:12-40` — Refresh accepts missing state.\n- **RAV-R3-F002 [medium] db** `src/db.ts:8` — New unrelated finding.\n' >"$report"
+    printf '[{"path":"src/auth.ts","start_line":12,"line":40,"side":"RIGHT","start_side":"RIGHT","severity":"high","body":"**[high] auth** — Refresh accepts missing state."},{"path":"src/db.ts","line":8,"side":"RIGHT","severity":"medium","body":"**[medium] db** — New unrelated finding."}]\n' >"$report.inline.json"
+    printf '{"event":"APPROVE","head_sha":"head-sha","approval_allowed":true}\n' >"$report.approval.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$report"
+    jq -e '.event == "COMMENT" and (.comments | length) == 1 and (.comments[0].line == 8) and (.body | contains("Refresh accepts missing state"))' "$tmp/review-payload.json" >/dev/null
+}
+
+test_post_refuses_infra_failure_reports() {
+    local tmp report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    report="$tmp/report.md"
+    {
+        printf '# ⚒️ review-anvil report\n\n'
+        printf 'The review could not produce a code assessment because every reviewer process ended without a completed findings block.\n\n'
+        printf '## Failure\n\n'
+        printf 'Round 1 stopped after all three Codex reviewers failed. The default Codex shim pointed to a missing binary. The alternate installed CLI started each review, but all three processes reached the 420-second wrapper deadline without final output.\n'
+    } >"$report"
+
+    if "$HELPER" post github.com acme widgets 42 marker-123 "$report" >"$tmp/out" 2>"$tmp/err"; then
+        fail "infra-failure reports must not be posted by default"
+    fi
+    grep -Fq "infrastructure failure report detected" "$tmp/err" \
+        || fail "infra-failure refusal should be explicit"
+    [[ -f "$report" ]] || fail "infra-failure report should be left for diagnostics"
+}
+
+
+test_run_ordinal_is_pinned_by_pr_presets() {
+    if "$HELPER" check-pins review-anvil-pr \
+        "commit_mode,target,report_path,run_ordinal" \
+        "focus: auth, run_ordinal: 99" >/dev/null 2>&1; then
+        fail "review-anvil-pr must reject run_ordinal overrides"
+    fi
+    if "$HELPER" check-pins review-anvil-improve-pr \
+        "commit_mode,target,report_path,run_ordinal" \
+        "run_ordinal: 99" >/dev/null 2>&1; then
+        fail "review-anvil-improve-pr must reject run_ordinal overrides"
+    fi
+}
+
+test_engine_template_footer_uses_anchor() {
+    local skill="$ROOT/../../review-anvil/SKILL.md"
+    [[ -f "$skill" ]] || fail "engine SKILL.md not found at $skill"
+    grep -Fq '_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._' "$skill" \
+        || fail "engine report template footer must deep-link to the #review-anvil anchor"
+}
+
+SHA_A="3f545a5c2b1d4e6f8a9b0c1d2e3f4a5b6c7d8e9f"
+
+make_context_fixtures() {
+    local dir="$1"
+    cat >"$dir/report.md" <<'EOF'
+Two issues remain.
+
+<details>
+<summary>Issues and fixes</summary>
+
+- Refresh accepts missing state. <!-- review-anvil-report: id=RAV-RUN3-R2-F001 severity=medium area=auth path=src%2Fauth.ts start_line=- line=12 disposition=active -->
+- Write failures are reported as success. <!-- review-anvil-report: id=RAV-RUN3-R2-F002 severity=high area=db path=src%2Fdb.ts start_line=- line=8 disposition=active -->
+
+</details>
+
+```text
+<!-- review-anvil: context={"quoted":"keep me"} -->
+```
+
+_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._
+EOF
+    cat >"$dir/report.md.inline.json" <<'JSON'
+[
+  {"path": "src/auth.ts", "line": 12, "side": "RIGHT",
+   "body": "Refresh accepts missing state.\n\n<!-- review-anvil: prior_feedback=reintroduced -->\n\n<!-- review-anvil: id=RAV-RUN3-R2-F001 severity=medium area=auth -->"},
+  {"path": "src/db.ts", "line": 8, "side": "RIGHT",
+   "body": "Write failures are reported as success.\n\n<!-- review-anvil: id=RAV-RUN3-R2-F002 severity=high area=db -->"}
+]
+JSON
+    cat >"$dir/report.md.context.json" <<JSON
+{"v": 1, "findings": [
+  {"id": "RAV-RUN3-R2-F001", "revision": "$SHA_A", "items": [
+    {"kind": "file", "label": "Session -- write -->", "path": "src/session.ts", "lines": [[88, 96]]},
+    {"kind": "file", "label": "Required vars", "repo": "acme/app", "commit": "$SHA_A", "path": "src/env.ts", "lines": [[59, 59], [75, 75]]},
+    {"kind": "pr", "label": "Upstream fix", "repo": "acme/app", "number": 790},
+    {"kind": "file", "label": "Session -- write -->", "path": "src/session.ts", "lines": [[88, 96]]},
+    {"kind": "file", "label": "Escape", "path": "../etc/passwd"},
+    {"kind": "file", "label": "No commit", "repo": "acme/app", "path": "a.ts"},
+    {"kind": "file", "label": "Backwards", "path": "a.ts", "lines": [[5, 2]]}
+  ]},
+  {"id": "RAV-RUN3-R2-F002", "revision": "main", "items": []},
+  {"id": "RAV-RUN3-R2-F009", "items": [{"kind": "file", "label": "Gone", "path": "x.ts"}]}
+]}
+JSON
+}
+
+context_payload() {
+    # $1 = text, $2 = finding ID: the decoded payload of that finding's line.
+    printf '%s\n' "$1" \
+        | sed -n 's/^<!-- review-anvil: context=\(.*\) -->$/\1/p' \
+        | jq -c --arg id "$2" 'select(.id == $id)'
+}
+
+test_embed_context_validates_and_is_idempotent() {
+    local tmp stderr report
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    make_context_fixtures "$tmp"
+    stderr="$tmp/stderr"
+
+    "$HELPER" embed-context "$tmp/report.md" "$tmp/report.md.context.json" 2>"$stderr"
+
+    report="$(cat "$tmp/report.md")"
+    jq -en --arg sha "$SHA_A" --argjson got "$(context_payload "$report" RAV-RUN3-R2-F001)" '$got == {v:1,id:"RAV-RUN3-R2-F001",revision:$sha,items:[
+        {kind:"file",label:"Session -- write -->",path:"src/session.ts",lines:[[88,96]]},
+        {kind:"file",label:"Required vars",repo:"acme/app",commit:$sha,path:"src/env.ts",lines:[[59,59],[75,75]]},
+        {kind:"pr",label:"Upstream fix",repo:"acme/app",number:790}]}' >/dev/null \
+        || fail "F001 record did not round-trip: $report"
+    jq -en --argjson got "$(context_payload "$report" RAV-RUN3-R2-F002)" '$got == {v:1,id:"RAV-RUN3-R2-F002",items:[]}' >/dev/null \
+        || fail "an invalid revision must be omitted, keeping the record"
+    [[ -z "$(context_payload "$report" RAV-RUN3-R2-F009)" ]] || fail "records for unlisted findings must not be posted"
+    [[ "$(sed -n 's/^<!-- review-anvil: context=\(.*\) -->$/\1/p' "$tmp/report.md")" != *--* ]] \
+        || fail "context payloads must not contain --"
+    grep -Fxq '<!-- review-anvil: context={"quoted":"keep me"} -->' "$tmp/report.md" || fail "fenced quotes must survive"
+    [[ "$(tail -n1 "$tmp/report.md")" == '_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._' ]] \
+        || fail "footer must stay last"
+    grep -Fq "invalid path '../etc/passwd'" "$stderr" || fail "dropped items must warn"
+
+    cp "$tmp/report.md" "$tmp/once.md"
+    "$HELPER" embed-context "$tmp/report.md" "$tmp/report.md.context.json" 2>/dev/null
+    cmp -s "$tmp/report.md" "$tmp/once.md" || fail "second run changed the report"
+
+    # Without a context file, earlier lines are still removed before a retry.
+    rm "$tmp/report.md.context.json"
+    "$HELPER" embed-context "$tmp/report.md" "$tmp/report.md.context.json" 2>/dev/null
+    ! grep -q '^<!-- review-anvil: context={"v"' "$tmp/report.md" || fail "a missing context file must clear stale lines"
+}
+
+test_embed_context_never_blocks_posting() {
+    local tmp stderr
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    make_context_fixtures "$tmp"
+    stderr="$tmp/stderr"
+    cp "$tmp/report.md" "$tmp/orig.md"
+
+    for bad in '{not json' '{"v":true,"findings":[]}'; do
+        printf '%s' "$bad" >"$tmp/report.md.context.json"
+        "$HELPER" embed-context "$tmp/report.md" "$tmp/report.md.context.json" 2>"$stderr" \
+            || fail "malformed context must not fail: $bad"
+        cmp -s "$tmp/report.md" "$tmp/orig.md" || fail "malformed context must leave the report unchanged: $bad"
+        [[ -s "$stderr" ]] || fail "malformed context must warn: $bad"
+    done
+
+    # A report near GitHub's limit keeps its content and drops the block.
+    printf '{"v":1,"findings":[{"id":"RAV-RUN3-R2-F001","items":[]}]}' >"$tmp/report.md.context.json"
+    { head -c 59990 /dev/zero | tr '\0' 'x'; printf '\n'; cat "$tmp/orig.md"; } >"$tmp/report.md"
+    cp "$tmp/report.md" "$tmp/big.md"
+    "$HELPER" embed-context "$tmp/report.md" "$tmp/report.md.context.json" 2>"$stderr"
+    cmp -s "$tmp/report.md" "$tmp/big.md" || fail "over-budget block must be omitted"
+    grep -q 'report block omitted' "$stderr" || fail "over-budget block must warn"
+}
+
+test_post_embeds_finding_context() {
+    local tmp bin
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    make_context_fixtures "$tmp"
+    printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$tmp/report.md.approval.json"
+
+    GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+    GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+    REVIEW_ANVIL_SKIP_DISMISSED=1 \
+    PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 marker-123 "$tmp/report.md" >/dev/null 2>&1
+
+    jq -e '.body | [scan("review-anvil: context=\\{\"v\"")] | length == 2' "$tmp/review-payload.json" >/dev/null \
+        || fail "review body must carry one record per listed finding"
+    jq -e '[.comments[].body | contains("review-anvil: context=")] | any | not' "$tmp/review-payload.json" >/dev/null \
+        || fail "inline comments must not repeat the report's context"
+    assert_file_missing "$tmp/report.md.context.json"
+}
+
+test_history_ignores_context_lines() {
+    local tmp bin fixture output
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "author":{"login":"pr-author"},
+  "reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[
+    {"state":"COMMENTED","body":"<!-- review-anvil-marker: run-c -->\nOne issue.\n\n<details>\n<summary>Issues and fixes</summary>\n\n- Refresh accepts missing state. <!-- review-anvil-report: id=RAV-RUN4-R1-F001 severity=medium area=auth path=src%2Fauth.py start_line=- line=12 disposition=active -->\n\n</details>\n\n<!-- review-anvil: context={\"v\":1,\"id\":\"RAV-RUN4-R1-F001\",\"revision\":null,\"items\":[{\"kind\":\"file\",\"label\":\"**[high] auth**: Phantom finding\",\"path\":\"a.py\"}]} -->\n\n_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._","url":"https://example.invalid/c"}
+  ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    output="$(GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" "$HELPER" history github.com acme widgets 42)"
+    [[ "$output" == *"RAV-RUN4-R1-F001"* ]] || fail "history lost the real finding: $output"
+    [[ "$output" != *"Phantom"* ]] || fail "history parsed a context label as a finding: $output"
+}
+
+main() {
+    command -v jq >/dev/null 2>&1 || fail "jq is required"
+    test_history_includes_author_replies_for_anvil_threads
+    test_post_resolves_author_explained_anvil_thread
+    test_resolve_refuses_changed_pr_head
+    test_post_refuses_to_resolve_non_anvil_thread
+    test_accepted_author_explanation_prevents_recurrence
+    test_reintroduced_finding_outranks_accepted_author_explanation
+    test_process_inline
+    test_process_inline_infers_id_prefixed_severity
+    test_process_inline_preserves_terminal_finding_metadata
+    test_embed_context_validates_and_is_idempotent
+    test_embed_context_never_blocks_posting
+    test_post_embeds_finding_context
+    test_history_ignores_context_lines
+    test_process_inline_rejects_severity_mismatch
+    test_process_inline_rejects_invalid_marker_severity_field
+    test_history_parses_hidden_inline_metadata
+    test_hidden_identity_outranks_rewritten_prose
+    test_post_review_success
+    test_post_approval_body_only_retains_inline_details
+    test_post_head_move_note_stays_collapsed
+    test_post_approval_rejection_note_stays_collapsed
+    test_post_fallback_comment
+    test_post_start_uses_short_declarative_comment
+    test_post_update_success
+    test_post_update_refresh_failure_omits_inline_details
+    test_post_adversarial_off_downgrades_approval
+    test_post_dismisses_id_prefixed_report_findings
+    test_compact_report_preserves_body_losslessly
+    test_compact_report_preserves_invalid_and_fenced_text
+    test_compact_report_preserves_wrapped_reproduction_metadata
+    test_post_dismisses_table_report_findings
+    test_dismissal_respects_report_paths
+    test_next_run_counts_distinct_finalized_reports
+    test_next_run_degrades_gracefully_when_history_is_unavailable
+    test_next_run_skips_graphql_in_degraded_mode
+    test_history_parses_provenance_ids_and_rejects_malformed_tokens
+    test_history_parses_clarity_report_findings
+    test_history_preserves_engine_generated_inline_and_grouped_ids
+    test_history_merges_duplicate_identity_into_open_thread
+    test_history_preserves_table_finding_identity
+    test_post_history_round_trip_preserves_modern_and_legacy_identity
+    test_post_history_round_trip_preserves_low_nit_and_set_aside_ids
+    test_history_includes_open_resolved_outdated_and_summary_only
+    test_post_suppresses_duplicate_open_thread_but_keeps_status
+    test_history_paginates_without_refetch_duplicates
+    test_local_suppression_overrides_open_history
+    test_compact_post_fails_closed_when_refresh_changes_inventory
+    test_post_time_material_history_downgrades_approval
+    test_outside_history_does_not_downgrade_approval
+    test_author_resolved_thread_is_not_raised_again
+    test_non_author_resolved_thread_remains_revalidated
+    test_reintroduced_author_resolved_finding_is_posted_and_remains_history_actionable
+    test_body_only_report_reintroduction_outranks_author_resolved_history
+    test_top_level_fallback_reintroduction_outranks_author_resolved_history
+    test_reintroduced_medium_finding_preserves_approval
+    test_report_marker_reintroduction_preserves_inline_companion
+    test_inline_reintroduction_preserves_report_companion
+    test_report_marker_reintroduction_persists_without_history
+    test_inline_reintroduction_persists_without_history
+    test_report_marker_range_reintroduction_preserves_inline_companion
+    test_inline_field_range_reintroduction_preserves_report_companion
+    test_position_only_reintroduction_does_not_mark_ambiguous_companions
+    test_position_only_field_does_not_mark_ambiguous_report_companion
+    test_author_resolved_outranks_equivalent_open_history
+    test_author_resolved_does_not_outrank_distinct_open_history
+    test_distinct_open_history_is_revalidated_when_author_resolved_comes_first
+    test_post_refuses_infra_failure_reports
+    test_run_ordinal_is_pinned_by_pr_presets
+    test_engine_template_footer_uses_anchor
+    printf 'test-pr-helper: all e2e checks passed\n'
+}
+
+main "$@"
