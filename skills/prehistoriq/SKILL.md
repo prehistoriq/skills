@@ -16,11 +16,11 @@ Sharing must never fail the user's task. Do the task first. If any `prehistoriq`
 
 ## Steps
 
-1. **Pick the area.** Use the area the user names. Otherwise pick it from the content. Review findings go to `findings`. An explanation of the change goes to `overview`. When unsure, ask.
+1. **Pick the area.** Use the area the user names. Otherwise run `prehistoriq areas` to see each area and its bound skill, and pick the area whose bound skill produced the content. Otherwise pick it from the content. Review findings go to `findings`. An explanation of the change goes to `overview`. When unsure, ask.
 2. **Check the CLI.** Run `command -v prehistoriq`. If it fails, skip the share steps below. Still do steps 3 and 4 with the bundled guide, and say "prehistoriq sharing skipped: CLI not installed".
 3. **Read the contract.** Run `prehistoriq guide <area>` and follow it. If the command fails, read `guides/<area>.md` next to this SKILL.md. It is the same text.
 4. **Write the file.**
-   - Output from the area's bound skill already meets the contract. Share it as written. `prehistoriq areas` lists each area and its bound skill.
+   - Output from the area's bound skill already meets the contract. Share it as written.
    - review-anvil reports are accepted as written for `findings`. Do not convert them.
    - Any Markdown with a title already meets the plain level. Add a `summary` in frontmatter when you can.
    - For `findings`, convert other review output to the structured level. Each finding gets a marker, a heading, its text and a context line. Read each anchor and context span before you write it.

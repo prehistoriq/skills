@@ -36,13 +36,13 @@ The skills share their output with `prehistoriq share` when the prehistoriq CLI 
 
 ## Local testing
 
-Install from a local clone into a throwaway home, so your real skill dirs stay untouched.
+Install from a local clone into a throwaway home. `env -i` keeps your real HOME and harness variables such as `CLAUDE_CONFIG_DIR` out of each command, so `--all` reaches only the throwaway home.
 
 ```bash
-export HOME=$(mktemp -d)
-npx skills add /path/to/skills -g -a claude-code -y
-ls -la ~/.claude/skills ~/.agents/skills
-npx skills remove -g -y --all
+T=$(mktemp -d)
+env -i HOME="$T" PATH="$PATH" npx skills add /path/to/skills -g -a claude-code codex -y
+ls -la "$T/.claude/skills" "$T/.agents/skills"
+env -i HOME="$T" PATH="$PATH" npx skills remove -g -y --all
 ```
 
 Check the frontmatter and the guide examples before you open a PR. CI runs the same command.
