@@ -6,6 +6,12 @@ Agent skills for [prehistoriq](https://github.com/prehistoriq/prehistoriq) areas
 npx skills add prehistoriq/skills
 ```
 
+Install a release by its tag. [CHANGELOG.md](CHANGELOG.md) lists the releases.
+
+```bash
+npx skills@1 add 'prehistoriq/skills#v0.1.0'
+```
+
 ## Areas
 
 | Area | Default skill | What it writes |

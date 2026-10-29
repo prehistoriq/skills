@@ -1,0 +1,30 @@
+# Changelog
+
+Releases are git tags. Install one with `npx skills@1 add 'prehistoriq/skills#<tag>'`.
+
+## 0.1.0
+
+The first release.
+
+### Skills
+
+- `review-anvil`. The multi-agent review engine. Copied from [mrshu/agent-skills](https://github.com/mrshu/agent-skills) at `9cb0b90ce5deaf8b8ae3c4ac70c6d269cff11413`, without `evaluations/`.
+- `review-anvil-pr`, `review-anvil-readonly` and `review-anvil-improve-pr`. The engine's presets, copied at the same commit. `review-anvil-pr` is bound to the `findings` area. It shares its report with `prehistoriq share findings` before it posts the PR comment. `skills/review-anvil/SOURCE.md` lists every local edit.
+- `show-me-pr`. Explains a PR as one `overview.md` with four perspectives, each drawn as a Mermaid diagram. It is bound to the `overview` area and shares with `prehistoriq share overview`. Adapted from HumanLayer's show-me, MIT.
+- `prehistoriq`. The bridge skill. It turns any skill's output into an area's format and shares it. Sharing never fails the user's task.
+
+### Guides
+
+- `skills/prehistoriq/guides/findings.md` defines the findings contract. It covers the finding marker, the `scope` field, the context line and the three levels.
+- `skills/prehistoriq/guides/overview.md` defines the overview contract. It has two levels and no required structure.
+- Both are the same text `prehistoriq guide <area>` prints. The bridge skill reads them when the CLI is missing.
+
+### If you used show-me-pr before
+
+The earlier show-me-pr lived in `skills/show-me-pr` of prehistoriq/prehistoriq. The prehistoriq worker ran it for the Chunks tab, which is retired. Its `plugin.json` also said 0.1.0, but it is a different skill.
+
+- It took an `output_path` and wrote one JSON object of four chunks. It now writes Markdown.
+- The output is `.show-me-pr/overview.md` at the repository root, unless you name another directory. The directory also holds any images the overview links.
+- `overview.md` starts with frontmatter and has four sections, one Mermaid diagram each.
+- It shares the overview itself when the prehistoriq CLI is installed.
+- Remove any copy of the old skill and install this one with `npx skills add`.
