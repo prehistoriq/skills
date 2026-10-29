@@ -2,7 +2,7 @@
 
 The findings area holds code review findings for a pull request. prehistoriq shows each finding next to the code it is about, on the PR's Findings tab.
 
-Write one Markdown file. Share it with `prehistoriq share findings <file>`.
+Write one Markdown file. Share it with `prehistoriq share findings <file>`, or pipe the Markdown into `prehistoriq share findings -`.
 
 ## Levels
 
@@ -114,9 +114,10 @@ A report from the review-anvil skills is accepted as written. Its `review-anvil-
 
 ```bash
 prehistoriq share findings review.md
+cat review.md | prehistoriq share findings -
 ```
 
-`share` attaches the file to the current `HEAD` commit, and through it to the PR. It prints one line that says what happened.
+`share` attaches the file to the current `HEAD` commit, and through it to the PR. It prints one line that says what happened. `-` reads the Markdown from stdin, so no file lands in the repository. Only the file form reads a review-anvil report's `.context.json` next to it.
 
 | Exit | Meaning | What to do |
 | --- | --- | --- |

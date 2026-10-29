@@ -9,7 +9,7 @@ npx skills add prehistoriq/skills
 Install a release by its tag. [CHANGELOG.md](CHANGELOG.md) lists the releases.
 
 ```bash
-npx skills@1 add 'prehistoriq/skills#v0.1.0'
+npx skills@1 add 'prehistoriq/skills#v0.2.0'
 ```
 
 ## Areas
@@ -38,7 +38,7 @@ The area guides live in `skills/prehistoriq/guides/`. They are the same text `pr
 
 ## Sharing
 
-The skills share their output with `prehistoriq share` when the prehistoriq CLI is installed. When it is not, they finish their task and say that sharing was skipped.
+The skills here don't share anything themselves. `prq setup` binds a skill to each area, ours or anyone's, and writes a short rule into each agent tool's instructions. The rule asks the agent to share a bound skill's final result with `prq share <area> -` or `prq share <area> <file>`. Where the tool has an end-of-turn hook, prehistoriq also reminds the agent once when a bound skill ran and nothing was shared.
 
 ## Local testing
 

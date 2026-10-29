@@ -2,7 +2,7 @@
 
 The overview area holds an explanation of a pull request that people read before the diff. prehistoriq shows it on the PR's Overview tab.
 
-Write one Markdown file. Share it with `prehistoriq share overview <file>`. The content has no required structure.
+Write one Markdown file. Share it with `prehistoriq share overview <file>`, or pipe the Markdown into `prehistoriq share overview -`. The content has no required structure.
 
 ## Levels
 
@@ -62,7 +62,7 @@ The Markdown body is at most 2 MB.
 prehistoriq share overview out/overview.md
 ```
 
-`share` attaches the file and its linked images to the current `HEAD` commit, and through it to the PR. It prints one line that says what happened.
+`share` attaches the file and its linked images to the current `HEAD` commit, and through it to the PR. It prints one line that says what happened. `-` reads the Markdown from stdin instead. Stdin can't carry images, so `share` refuses a relative image link there. Put an overview with images in its own folder outside the repository, such as one from `mktemp -d`, and share the file.
 
 | Exit | Meaning | What to do |
 | --- | --- | --- |

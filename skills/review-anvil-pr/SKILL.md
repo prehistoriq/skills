@@ -127,13 +127,7 @@ Provide `$HEAD_SHA` to the engine for its `.approval.json` `head_sha` field — 
 
 The engine runs the review loop, writes the final report to `<REPORT_PATH>` (on failure paths too), and prints that path on its last output line. Before posting, if `<REPORT_PATH>.followups.json` exists, read it and surface its entries to the user (the helper deletes it after a successful post; `auto_approved` entries are the only ones automation may file issues for, after a duplicate search).
 
-**Share with prehistoriq.** After the engine writes `<REPORT_PATH>` and before step 4, run this. `post` deletes the report and its `.context.json` on success, so sharing comes first. `share` reads `<REPORT_PATH>.context.json` itself.
-
-```bash
-if command -v prehistoriq >/dev/null; then prehistoriq share findings "$REPORT_PATH" || true; fi
-```
-
-Relay its one line of output. Never fail or stop the review because sharing failed.
+**Final report.** `<REPORT_PATH>` now holds the final report, and `<REPORT_PATH>.context.json` its finding context. Step 4 deletes both on success, so anything that needs the final report reads it before step 4.
 
 ### 4. Post
 

@@ -2,6 +2,25 @@
 
 Releases are git tags. Install one with `npx skills@1 add 'prehistoriq/skills#<tag>'`.
 
+## 0.2.0
+
+Our skills no longer share by themselves. They follow the same area rule as any skill bound to an area.
+
+### Skills
+
+- `show-me-pr`. The **Share** section is gone. The skill ends by telling the user where `overview.md` is.
+- `review-anvil-pr`. The **Share with prehistoriq** paragraph is replaced by a **Final report** note. It says the report is final before `post` deletes it. `skills/review-anvil/SOURCE.md` lists the edit.
+- `prehistoriq`. The bridge skill shares Markdown that is in no file with `prehistoriq share <area> -`, and only a skill's final result.
+
+### Guides
+
+- Both guides show `prehistoriq share <area> -`, which reads the Markdown from stdin.
+- The overview guide says stdin can't carry images, and to share an overview with images from its own folder.
+
+### Needs
+
+- prehistoriq CLI 0.8.1 or later, whose `setup` writes the area rule and reads stdin with `share -`. With an older CLI, our skills finish without sharing.
+
 ## 0.1.0
 
 The first release.

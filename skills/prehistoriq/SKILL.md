@@ -24,8 +24,8 @@ Sharing must never fail the user's task. Do the task first. If any `prehistoriq`
    - review-anvil reports are accepted as written for `findings`. Do not convert them.
    - Any Markdown with a title already meets the plain level. Add a `summary` in frontmatter when you can.
    - For `findings`, convert other review output to the structured level. Each finding gets a marker, a heading, its text and a context line. Read each anchor and context span before you write it.
-   - Write the converted content to a new file. Never overwrite the user's original.
-5. **Share.** Run `prehistoriq share <area> <file>` and relay its one line of output.
+   - Write converted content to a new file outside the repository, such as in a folder from `mktemp -d`, or keep it for stdin. Never overwrite the user's original.
+5. **Share.** Run `prehistoriq share <area> <file>`, or pipe Markdown that is in no file into `prehistoriq share <area> -`. Relay its one line of output. Share only a skill's final result, never an intermediate round or draft.
 6. **Handle the exit.**
    - Exit 0. Done.
    - Exit 1. Run the same command once more.

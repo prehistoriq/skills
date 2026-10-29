@@ -103,12 +103,6 @@ Never write a Markdown link to a source file. Every relative link in `overview.m
 
 Keep `overview.md` under 2 MB. On a very large change, explain the main path and group mechanical changes into one node such as "12 test files updated".
 
-## Share
+## Finish
 
-When you are done, share the overview with prehistoriq. Sharing must never fail the user's task.
-
-1. Run `command -v prehistoriq`. If it fails, finish and say "prehistoriq sharing skipped: CLI not installed".
-2. Run `prehistoriq share overview <output dir>/overview.md` and relay its one line of output.
-3. On exit 1, run it once more. On exit 2, report the contract error it printed. On any other non-zero exit, such as an unknown command in an older CLI, say "prehistoriq sharing skipped" and give the reason.
-
-Then tell the user where `overview.md` is and give its title.
+Tell the user where `overview.md` is and give its title.
