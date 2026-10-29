@@ -14,6 +14,8 @@ The contract has three levels. Each one is optional on top of the one before it.
 
 Write the structured level whenever you can. The other levels exist so that any review can still be shared.
 
+Every relative link uploads as a file, so link only images. A relative link to a source file, such as `[sync](src/sync.ts)`, is not an asset, and `share` rejects it as `unsupported_asset`. Cite source code as inline code with a path and a line range, as in `src/sync.ts:40-52`, or put it in a context line.
+
 ## A structured finding
 
 ```markdown
@@ -85,7 +87,7 @@ A pull request item.
 <!-- prehistoriq:context {"items":[{"kind":"file","label":"token check in the shared client","path":"src/auth/client.ts","lines":[[14,31]]},{"kind":"pr","label":"PR that added the refresh path","number":412}]} -->
 ```
 
-The JSON must not contain two hyphens in a row, because `--` can end the HTML comment early. Write a hyphen as `-` where that would happen. It is still valid JSON.
+The JSON must not contain two hyphens in a row, because `--` can end the HTML comment early. Write a hyphen as `\u002d` where that would happen. It is still valid JSON.
 
 prehistoriq checks each item when you share. It reads every same-repository file at the shared commit and keeps the spans that exist. An item that fails a check is dropped with a warning. It never fails the share.
 
