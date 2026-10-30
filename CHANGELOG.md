@@ -10,6 +10,10 @@ Releases are git tags. Install one with `npx skills@1 add 'prehistoriq/skills#<t
 
 - `prehistoriq`. The bridge skill is now a short reference to `prq areas`, `prq areas --skill <name>`, `prq guide <area>` and `prq share`. It says that `prq`'s output wins over the skill. It no longer lists areas, bound skills or format rules.
 
+### Guides
+
+- `skills/prehistoriq/guides/` is gone. prq owns the area formats, and `prq guide <area>` prints the current one. `scripts/check-skills.mjs` now checks only the skills' frontmatter and declared areas.
+
 ### Needs
 
 - A prq CLI whose `areas --skill` prints what to do and whose `share --skill` skips with `not_bound`.

@@ -34,7 +34,7 @@ A skill declares its area in its frontmatter with `metadata.prehistoriq-area`.
 
 The review-anvil skills are copied from [mrshu/agent-skills](https://github.com/mrshu/agent-skills) with the owner's approval. `skills/review-anvil/SOURCE.md` records the pinned commit and every local edit.
 
-The area guides live in `skills/prehistoriq/guides/`. They are the same text `prehistoriq guide <area>` prints.
+The area formats live in prq. `prq guide <area>` prints the current one.
 
 ## Sharing
 
@@ -51,7 +51,7 @@ ls -la "$T/.claude/skills" "$T/.agents/skills"
 env -i HOME="$T" PATH="$PATH" npx skills remove -g -y --all
 ```
 
-Check the frontmatter and the guide examples before you open a PR. CI runs the same command.
+Check the frontmatter before you open a PR. CI runs the same command.
 
 ```bash
 node scripts/check-skills.mjs
