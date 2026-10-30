@@ -31,7 +31,7 @@ Every file not listed here is byte-identical to the upstream file at the SHA abo
 
    This binds the preset to the prehistoriq findings area.
 
-2. `review-anvil-pr/SKILL.md`. A **Share with prehistoriq** paragraph at the end of step 3, before step 4. It runs `prehistoriq share findings "$REPORT_PATH"` when `command -v prehistoriq` succeeds, and never fails the review. It sits before `post`, because `post` deletes the report.
+2. `review-anvil-pr/SKILL.md`. A **Final report** paragraph at the end of step 3, before step 4. It says that `<REPORT_PATH>` and its `.context.json` hold the final report there, and that step 4 deletes both on success. The area rule that `prq setup` writes shares the final result, and this tells the agent to read it before `post` removes it. Until 0.2.0 this paragraph ran `prehistoriq share findings` itself.
 
 ## Known upstream text
 
