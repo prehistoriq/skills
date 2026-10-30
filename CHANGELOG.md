@@ -2,6 +2,18 @@
 
 Releases are git tags. Install one with `npx skills@1 add 'prehistoriq/skills#<tag>'`.
 
+## Unreleased
+
+`prq` decides what is shared. Our skills only point at it.
+
+### Skills
+
+- `prehistoriq`. The bridge skill is now a short reference to `prq areas`, `prq areas --skill <name>`, `prq guide <area>` and `prq share`. It says that `prq`'s output wins over the skill. It no longer lists areas, bound skills or format rules.
+
+### Needs
+
+- A prq CLI whose `areas --skill` prints what to do and whose `share --skill` skips with `not_bound`.
+
 ## 0.2.0
 
 Our skills no longer share by themselves. They follow the same area rule as any skill bound to an area.

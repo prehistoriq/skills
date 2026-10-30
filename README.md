@@ -26,7 +26,7 @@ A skill declares its area in its frontmatter with `metadata.prehistoriq-area`.
 | Skill | Purpose |
 | --- | --- |
 | `show-me-pr` | Explains a PR as one Markdown overview. Adapted from HumanLayer's show-me, MIT. |
-| `prehistoriq` | The bridge skill. It turns any skill's output into an area's format and shares it. |
+| `prehistoriq` | A reference to the `prq` commands that say what is shared, in which format, and share it. |
 | `review-anvil-pr` | Reviews a GitHub PR with several agents and posts the report as a PR comment. |
 | `review-anvil` | The review engine the presets run. |
 | `review-anvil-readonly` | Reviews a diff, branch or path without editing anything. |
@@ -38,7 +38,7 @@ The area guides live in `skills/prehistoriq/guides/`. They are the same text `pr
 
 ## Sharing
 
-The skills here don't share anything themselves. `prq setup` binds a skill to each area, ours or anyone's, and writes a short rule into each agent tool's instructions. The rule asks the agent to share a bound skill's final result with `prq share <area> -` or `prq share <area> <file>`. Where the tool has an end-of-turn hook, prehistoriq also reminds the agent once when a bound skill ran and nothing was shared.
+The skills here don't share anything themselves. `prq setup` binds a skill to each area, ours or anyone's, and writes a short rule into each agent tool's instructions. The rule names no skill. It asks the agent to run `prq areas --skill <name>` when a skill finishes and to do what it prints. `prq share <area> <file> --skill <name>` skips with `not_bound` when the skill isn't bound to the area, so a stale instruction can't share the wrong result. Where the tool has an end-of-turn hook, prehistoriq also reminds the agent once when a bound skill ran and nothing was shared.
 
 ## Local testing
 
